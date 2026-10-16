@@ -38,7 +38,7 @@ Success criteria:
 
 OCR of text in images *is* in scope here (section 4.3). Classifying what an image
 depicts is not. Out of scope here: everything else in projects 2-4. Core only emits the *signals* later
-projects need (join-wave signal, strike counts, incident records).
+projects need (strike counts, incident records).
 
 Minimal operator surface that *is* in scope: a `/guard` command group with
 `status` and `mode observe|enforce` (requires Manage Guild), plus two mod-log
@@ -66,7 +66,9 @@ reverse a mistake. All other settings live in `config.toml`.
   `context_id` (Discord channel ID; the thread ID inside threads).
 - Returns per-category `score` (0-1) for categories enabled in the Paxmod project.
   The bot reads **scores**, not Paxmod's `flagged`, and applies its own thresholds in
-  the fusion step. Paxmod project requirements: type Text, standard mode, with at
+  the fusion step. Advanced-mode projects return one `Policy Violation` score (the operator's
+  written policy), which fusion treats as spam risk and shows Paxmod's `reason` as
+  evidence. Standard-mode project requirements: type Text, with at
   least Spam, Harassment, Hate and Discrimination, Threatening, Personally
   Identifiable Information and Dangerous and Criminal Content enabled.
 - Special results:
@@ -277,9 +279,8 @@ for a day is Fresh until it passes both thresholds.
 
 - Escalate up one tier (max Quarantine) if the member has an active strike, a prior
   flagged message in the last 30 days, a first message containing a link or mention,
-  a join-screening flag, or is part of a join wave (3 or more joins within 2 minutes
-  with account ages within 1 hour of each other; this is only a signal, lockdown is
-  project 3).
+  or a join-screening flag. Join waves are not handled here; Discord's own raid
+  protection covers them.
 - Clean-message graduation: a Fresh member with at least N clean scanned messages
   (default 10) drops from "scan every message" to "sample" (section 6.3). It does
   not change the tier label or the action thresholds. Any flag resets the count.
@@ -513,3 +514,7 @@ and Embed Links in the log channel.
    response and fusion will use it; until then it is stored as evidence only.
 7. An OCR.space API key (free tier: 25,000 requests per month, 500 per day, 1 MB per
    image; PRO for more). Confirm that "use Copyfish" meant the OCR.space engine.
+
+Verified live (2026-10-16): the operator's Paxmod project is advanced mode; its `/text`
+response carries no Player Context fields (only `user_id`/`context_id` are inputs);
+OCR.space Engine 2 reads clean screenshot text accurately.
