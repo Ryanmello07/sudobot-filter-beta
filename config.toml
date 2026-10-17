@@ -1,0 +1,84 @@
+# sudobot-chat-guard behavior. Secrets and API keys live in .env, not here.
+# Read once at startup: restart the bot after editing. Only the Observe/Enforce
+# mode changes at runtime (via /guard mode).
+#
+# Every value below is the built-in default except where noted; delete what you do
+# not change. Per-guild overrides go under [guild.<guild id>] and merge over [defaults].
+
+[runtime]
+queue_size = 256            # total pending messages across workers
+workers = 8
+retention_days = 14         # incident retention, 7-30
+jev_cache_ttl_secs = 600
+jev_text_chars = 2000
+jev_prior_messages = 3
+
+[paxmod]
+# scanned         only messages already scanned are sent
+# active_channels also send every message in a channel where a new member spoke
+#                 recently, so Paxmod's Player Context sees the conversation
+# all             send every human message (highest coverage and cost)
+context_feed = "active_channels"
+feed_window_minutes = 10
+
+[ocr]
+max_images_per_message = 4
+max_download_bytes = 8388608
+min_text_chars = 4
+cache_ttl_secs = 3600
+
+[defaults]
+# REQUIRED for useful mod-log output: set your log channel ID.
+# log_channel_id = 123456789012345678
+trusted_role_ids = []
+allowlisted_user_ids = []
+blocked_domains = []
+allowed_invites = []        # invite codes of your own servers
+
+[defaults.tiers]
+quarantine_minutes_in_guild = 30
+quarantine_account_hours = 24
+fresh_days_in_guild = 7
+fresh_account_days = 30
+graduation_clean_messages = 10
+
+[defaults.plan]
+local_hit_threshold = 0.30
+fresh_sample_rate = 0.25
+established_sample_rate = 0.05
+
+[defaults.fusion]
+w_local = 0.6
+w_paxmod = 0.9
+w_jev = 0.9
+
+[defaults.ladder]
+timeout_minutes = 60
+ban_delete_seconds = 3600   # Discord deletes in whole days; any value > 0 means 1 day
+sweep_minutes = 10
+strike_days = 30
+enable_delete = true
+enable_timeout = true
+enable_kick = true
+enable_ban = true
+repeat_offender_single_source = false
+
+# Fused-score thresholds per tier. Omit kick/ban to disable them for that tier.
+[defaults.ladder.quarantine]
+flag = 0.40
+delete = 0.60
+timeout = 0.70
+kick = 0.85
+ban = 0.95
+
+[defaults.ladder.fresh]
+flag = 0.50
+delete = 0.70
+timeout = 0.80
+kick = 0.92
+ban = 0.97
+
+[defaults.ladder.established]
+flag = 0.65
+delete = 0.85
+timeout = 0.92
