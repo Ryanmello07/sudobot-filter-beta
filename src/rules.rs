@@ -128,8 +128,12 @@ pub fn text_signals(text: &str, is_first_message: bool, rc: &RuleConfig, g: &Gui
         out.push(sig("first_message_link", w.first_message_link));
     }
 
-    let allowed: Vec<String> = g.allowed_invites.iter().map(|s| s.to_lowercase()).collect();
-    if extract_invite_codes(text).iter().any(|c| !allowed.contains(c)) {
+    // Invite codes are case-sensitive: compare the raw extracted code exactly.
+    // An invite that only appears after normalization (invisible chars, homoglyphs
+    // in the host) is evasion and is flagged regardless of the allowlist.
+    let raw_codes = extract_invite_codes(text);
+    let evasive = extract_invite_codes(&normalize(text)).len() > raw_codes.len();
+    if evasive || raw_codes.iter().any(|c| !g.allowed_invites.contains(c)) {
         out.push(sig("invite_link", w.invite_link));
     }
 
@@ -292,11 +296,9 @@ mod tests {
         assert!(t.snapshot(1, 2, now()).is_empty());
     }
 
-    // Regression S3: "evil.com." (trailing-dot FQDN) is the same host as "evil.com"
-    // and must match blocked_domains. extract_domains currently keeps the trailing
-    // dot, so neither the exact match nor the ".{blocked}" suffix match fires.
+    // Regression S3 (fixed): "evil.com." (trailing-dot FQDN) is the same host as
+    // "evil.com" and matches blocked_domains; extract_domains trims trailing dots.
     #[test]
-    #[ignore = "S3: trailing-dot domains do not match blocked_domains"]
     fn s3_trailing_dot_domain_matches_blocked() {
         let g = GuildConfig { blocked_domains: vec!["evil.com".into()], ..Default::default() };
         let rc = RuleConfig::default();
@@ -304,11 +306,9 @@ mod tests {
         assert!(text_signals("visit https://evil.com./now", false, &rc, &g).has("blocked_domain"));
     }
 
-    // Regression S8: the invite allowlist must be case-sensitive — allowlisting the
-    // code "AbC123" must not allowlist "abc123". Both sides are currently lowercased
-    // (normalize() lowercases the code, text_signals() lowercases the allowlist).
+    // Regression S8 (fixed): the invite allowlist is case-sensitive — codes are
+    // extracted from raw text preserving case and compared exactly.
     #[test]
-    #[ignore = "S8: invite allowlist comparison lowercases both sides, matching case-insensitively"]
     fn s8_invite_allowlist_is_case_sensitive() {
         let g = GuildConfig { allowed_invites: vec!["AbC123".into()], ..Default::default() };
         let f = facts("join discord.gg/abc123");

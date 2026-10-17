@@ -83,7 +83,8 @@ pub fn extract_domains(text: &str) -> Vec<String> {
         let with_scheme = if raw.contains("://") { raw.to_string() } else { format!("http://{raw}") };
         if let Ok(u) = url::Url::parse(&with_scheme) {
             if let Some(h) = u.host_str() {
-                let h = h.trim_start_matches("www.").to_string();
+                // Trim "www." and trailing dots: "evil.com." is the same host as "evil.com".
+                let h = h.trim_start_matches("www.").trim_end_matches('.').to_string();
                 if !out.contains(&h) {
                     out.push(h);
                 }
@@ -93,9 +94,11 @@ pub fn extract_domains(text: &str) -> Vec<String> {
     out
 }
 
+/// Invite codes from the RAW text, preserving case: Discord invite codes are
+/// case-sensitive, so allowlist comparisons must not see a lowercased code.
+/// (The regex still matches the invite host case-insensitively.)
 pub fn extract_invite_codes(text: &str) -> Vec<String> {
-    let n = normalize(text);
-    invite_re().captures_iter(&n).map(|c| c[1].to_string()).collect()
+    invite_re().captures_iter(text).map(|c| c[1].to_string()).collect()
 }
 
 pub fn contains_url(text: &str) -> bool {
@@ -136,7 +139,14 @@ mod tests {
 
     #[test]
     fn extracts_invites() {
+        // codes keep their original case (they are case-sensitive in Discord)
         let c = extract_invite_codes("join discord.gg/AbC123 or https://discord.com/invite/xyz");
-        assert_eq!(c, vec!["abc123".to_string(), "xyz".to_string()]);
+        assert_eq!(c, vec!["AbC123".to_string(), "xyz".to_string()]);
+    }
+
+    #[test]
+    fn trailing_dot_hosts_are_trimmed() {
+        assert_eq!(extract_domains("visit https://evil.com./now"), vec!["evil.com".to_string()]);
+        assert_eq!(extract_domains("see https://sub.evil.com./x"), vec!["sub.evil.com".to_string()]);
     }
 }

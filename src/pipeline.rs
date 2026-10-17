@@ -259,9 +259,13 @@ impl Pipeline {
         let mut jev: Option<JevResult> = None;
         if plan.providers && !combined.trim().is_empty() {
             let state = self.jev_state(&m, &profile, &ocr_text, &recent, now);
+            // The Jev cache key carries author context (tier + account-age bucket in
+            // hours) so a verdict for a brand-new account is never reused for an
+            // established one posting the same text.
+            let jev_ctx = format!("{}:{}", tier.name(), (now - m.profile.account_created).num_hours());
             let (p, j) = tokio::join!(
                 self.run_paxmod(&m, &combined, prio, now, &mut failures),
-                self.run_jev(g, &combined, state, prio, now)
+                self.run_jev(g, &combined, state, prio, now, &jev_ctx)
             );
             let (pr, pc) = p;
             let (jr, jc, jf) = j;
@@ -302,7 +306,9 @@ impl Pipeline {
 
         // ---- record ----
         let mut incident_id = None;
-        if planned >= Action::Flag {
+        // "already": the incident for this message exists and was actioned; do not
+        // overwrite its stored action_taken or post a second mod-log embed.
+        if planned >= Action::Flag && taken != "already" {
             let ni = NewIncident {
                 guild_id: g,
                 user_id: m.author_id,
@@ -442,8 +448,11 @@ impl Pipeline {
         }
     }
 
-    async fn run_jev(&self, guild: u64, text: &str, state: JevState, prio: Priority, now: DateTime<Utc>) -> (Option<JevResult>, Cov, Vec<String>) {
-        let key = hash_text(&normalize(text));
+    /// `cache_ctx` binds the cache entry to the author's trust context (tier and
+    /// account-age bucket), so identical text from different author contexts costs
+    /// separate calls and cannot share a verdict.
+    async fn run_jev(&self, guild: u64, text: &str, state: JevState, prio: Priority, now: DateTime<Utc>, cache_ctx: &str) -> (Option<JevResult>, Cov, Vec<String>) {
+        let key = hash_text(&format!("{cache_ctx}\n{}", normalize(text)));
         if let Some(hit) = self.jev_cache.get(&key) {
             return (Some(hit), Cov::Ran, vec![]);
         }
@@ -554,9 +563,13 @@ impl Pipeline {
             return;
         }
         let (pax, budget) = (self.d.paxmod.clone(), self.d.budgets.paxmod.clone());
+        let store = self.d.store.clone();
         let (text, user, ch) = (trunc(&m.content, 5000), m.author_id, m.channel_id);
         let h = tokio::spawn(async move {
             let g = guarded(&budget, Priority::Low, now, || pax.moderate(&text, Some(user), Some(ch))).await;
+            if g.called {
+                let _ = store.record_usage("paxmod", 1, g.result.is_err() as i64, now).await;
+            }
             if let Err(GuardErr::Provider(e)) = g.result {
                 tracing::debug!("context feed send failed: {e}");
             }
@@ -685,6 +698,9 @@ impl Pipeline {
         // Providers on the name fields. No context_id: names must not pollute conversations.
         let now_p = now;
         let g = guarded(&self.d.budgets.paxmod, Priority::Low, now_p, || self.d.paxmod.moderate(names.trim(), Some(j.user_id), None)).await;
+        if g.called {
+            let _ = self.d.store.record_usage("paxmod", 1, g.result.is_err() as i64, now).await;
+        }
         if let Ok(r) = g.result {
             let (spam, abuse) = crate::fusion::paxmod_risks(&r);
             if spam >= 0.7 || abuse >= 0.8 {
@@ -700,6 +716,9 @@ impl Pipeline {
             ..Default::default()
         };
         let g = guarded(&self.d.budgets.jev, Priority::Low, now_p, || self.d.jev.assess(&state)).await;
+        if g.called {
+            let _ = self.d.store.record_usage("jev", 1, g.result.is_err() as i64, now).await;
+        }
         if let Ok(r) = g.result {
             let (spam, _) = crate::fusion::jev_risks(&r);
             if spam >= 0.8 {
@@ -1194,8 +1213,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effective_log_channel_db_override_beats_config_default() {
-        let cfg = Config::from_toml_str("[defaults]\nlog_channel_id = 9\n").unwrap();
+    async fn context_feed_and_join_screening_record_usage() {
+        let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        let now = Utc::now();
+        // quarantine member speaks: scanned (paxmod 1, jev 1), opens the feed window
+        h.p.handle(msg(1, 7, "hello", new_user(7)), now).await;
+        // established member in the same channel: context-fed to Paxmod only
+        h.p.handle(msg(2, 8, "hi there friend", old_user(8)), now).await;
+        h.p.drain_feed().await;
+        // join screening calls both providers at Low priority
+        h.p.handle_join(JoinEvent { guild_id: 1, user_id: 9, username: "alice".into(), display_name: "a".into(), profile: old_user(9) }, now).await;
+        assert_eq!(h.p.store().usage_today("paxmod", now).await.0, 3, "scan + feed + join screening");
+        assert_eq!(h.p.store().usage_today("jev", now).await.0, 2, "scan + join screening");
+    }
+
+    #[tokio::test]
+    async fn effective_log_channel_db_override_beats_config_default() {        let cfg = Config::from_toml_str("[defaults]\nlog_channel_id = 9\n").unwrap();
         let h = harness_with_cfg(cfg, FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
         assert_eq!(h.p.effective_log_channel(1).await, Some(9), "config default applies when no DB override");
         h.p.store().set_log_channel(1, 42, 7).await.unwrap();
@@ -1220,13 +1253,10 @@ mod tests {
     }
 
     // ---------- regression tests for audit findings (all #[ignore]d) ----------
-    // Regression M5: reprocessing an already-actioned message must not clobber the
-    // stored action_taken ("delete+timeout") with "already". insert_incident's
-    // ON CONFLICT upsert currently overwrites it, erasing the record of what was
-    // actually done. (FakeSink never really deletes, so the second pass reaches the
-    // record step — mirroring a redelivered gateway event.)
+    // Regression M5 (fixed): reprocessing an already-actioned message returns
+    // "already" and leaves the stored incident's action_taken untouched (no upsert,
+    // no second mod-log embed).
     #[tokio::test]
-    #[ignore = "M5: incident upsert overwrites action_taken with \"already\" on reprocessing"]
     async fn m5_reprocessing_does_not_overwrite_action_taken() {
         let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
         let m = msg(5, 7, "buy cheap stuff now", new_user(7));
@@ -1240,14 +1270,11 @@ mod tests {
         assert_eq!(row.action_taken, "delete+timeout", "stored action_taken must survive reprocessing");
     }
 
-    // Regression S2: the Jev cache key is hash(normalize(text)) only, so identical
-    // text from authors with different tiers/account ages shares one cached verdict
-    // even though the JevState sent to the API carries account_age_days and
-    // minutes_in_guild. Desired: the cache key also covers author context, so two
-    // different authors cost two calls. NOTE: jev_cache is private, so this asserts
-    // the observable consequence (Jev call count) rather than the key itself.
+    // Regression S2 (fixed): the Jev cache key includes author context (tier and
+    // account-age bucket), so identical text from a 2h-old and a 20h-old quarantine
+    // account no longer shares one cached verdict. Asserted at the observable level
+    // (Jev call count) because jev_cache is private.
     #[tokio::test]
-    #[ignore = "S2: Jev cache key ignores author context (tier, account age)"]
     async fn s2_jev_cache_key_includes_author_context() {
         let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
         h.p.handle(msg(1, 7, "check this out", profile(7, 2, 3)), Utc::now()).await; // 2h-old account

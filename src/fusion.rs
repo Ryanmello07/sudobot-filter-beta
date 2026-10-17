@@ -32,16 +32,25 @@ pub fn paxmod_risks(p: &PaxmodResult) -> (f64, f64) {
 }
 
 pub fn jev_risks(j: &JevResult) -> (f64, f64) {
-    let p_legit = j
-        .class_probs
-        .get("legitimate")
-        .copied()
-        .unwrap_or(if j.class == "legitimate" { 1.0 } else { 0.0 });
-    let spam = (1.0 - p_legit)
-        .max(0.9 * j.dm_lure.max(j.crypto_giveaway))
-        .max(0.7 * j.evasion)
+    let p = |name: &str| j.class_probs.get(name).copied();
+    let p_legit = p("legitimate").unwrap_or(if j.class == "legitimate" { 1.0 } else { 0.0 });
+    // Spam risk comes from the spam-ish classes. The headline class is the fallback
+    // when the response carries no spam-ish probabilities at all. (1 - p_legit) must
+    // NOT be used unconditionally: an abuse verdict has low p_legit too, and counting
+    // it as spam mislabels pure abuse as spam.
+    let class_spam = ["spam", "scam_phishing", "promo_solicitation", "nsfw_lure"].iter().filter_map(|n| p(n)).fold(0.0, f64::max);
+    let class_spam = if class_spam > 0.0 {
+        class_spam
+    } else if matches!(j.class.as_str(), "spam" | "scam_phishing" | "promo_solicitation" | "nsfw_lure") {
+        1.0 - p_legit
+    } else {
+        0.0
+    };
+    let spam = class_spam.max(0.9 * j.dm_lure.max(j.crypto_giveaway)).max(0.7 * j.evasion).clamp(0.0, 1.0);
+    // Symmetric fallback: trust the headline class when other_abuse has no probability.
+    let abuse = p("other_abuse")
+        .unwrap_or(if j.class == "other_abuse" { 1.0 - p_legit } else { 0.0 })
         .clamp(0.0, 1.0);
-    let abuse = j.class_probs.get("other_abuse").copied().unwrap_or(0.0).clamp(0.0, 1.0);
     (spam, abuse)
 }
 
@@ -53,7 +62,12 @@ pub fn fuse(inp: &Inputs, cfg: &FusionConfig, clean_below: f64) -> Verdict {
     let mut evidence = vec![];
 
     if let Some(l) = inp.local {
-        spam_terms.push(cfg.w_local * l.score);
+        // When no other source contributed, the local score stands on its own:
+        // applying w_local would cap local-only verdicts at 0.6, below the quarantine
+        // delete threshold — even flagging would be unreachable during a provider
+        // outage. Multi-source fusion is unchanged (the weight still applies then).
+        let w = if inp.paxmod.is_none() && inp.jev.is_none() { 1.0 } else { cfg.w_local };
+        spam_terms.push(w * l.score);
         if l.score >= 0.5 {
             agreeing += 1;
         }
@@ -230,15 +244,11 @@ mod tests {
         assert!(!v.evidence.iter().any(|e| e.contains("Harassment")));
     }
 
-    // Regression M1: the fused score is capped by the source weight. A local-only
-    // verdict can never exceed w_local (0.6), and any realistic local score lands
-    // just UNDER the quarantine delete threshold (0.60): every rule firing at once
-    // gives a local score of ~0.9994, fusing to ~0.5996. So the strongest possible
-    // local-only detection can delete only after floating-point luck, and realistic
-    // maximal detections never can. Desired: a maximal local-only score reaches at
-    // least the quarantine delete threshold.
+    // Regression M1 (fixed): a local-only verdict is no longer capped by w_local —
+    // with no other source contributing, the local score fuses at full strength, so
+    // flag/delete stay reachable during provider outages. Multi-source math is
+    // unchanged (see sources_combine_noisy_or).
     #[test]
-    #[ignore = "M1: single-source fused score is capped below the quarantine delete threshold"]
     fn m1_local_only_max_score_reaches_quarantine_delete_threshold() {
         let delete = crate::config::LadderConfig::default().quarantine.delete.unwrap();
         // Sanity floor: an idealized local score of exactly 1.0 fuses to w_local.
@@ -261,11 +271,10 @@ mod tests {
         assert!(v.score >= delete, "max local score {:.4} fuses to {:.6}, below delete {delete}", maxed.score, v.score);
     }
 
-    // Regression M4: a Jev-only other_abuse verdict should be labeled Abuse. Today the
-    // spam term (1 - p_legitimate = 0.95, weighted 0.855) outweighs the abuse term
-    // (0.9, weighted 0.81), so the message is mislabeled Spam.
+    // Regression M4 (fixed): a Jev-only other_abuse verdict is labeled Abuse — spam
+    // risk is derived from the spam-ish classes (with the headline class as
+    // fallback), not from 1 - p_legitimate, which abuse verdicts also depress.
     #[test]
-    #[ignore = "M4: Jev-only other_abuse is labeled Spam instead of Abuse"]
     fn m4_jev_only_other_abuse_is_labeled_abuse() {
         let j = JevResult {
             class: "other_abuse".into(),
@@ -282,5 +291,25 @@ mod tests {
         };
         let v = fuse(&Inputs { jev: Some(&j), ..Default::default() }, &cfg(), 0.4);
         assert_eq!(v.label, Label::Abuse, "spam {:.3} abuse {:.3}", v.spam_score, v.abuse_score);
+    }
+
+    #[test]
+    fn jev_spam_comes_from_spam_classes_with_symmetric_fallbacks() {
+        // class probabilities present: spam only from spam-ish classes
+        let j = JevResult {
+            class: "other_abuse".into(),
+            class_probs: [("legitimate".to_string(), 0.05), ("other_abuse".to_string(), 0.9), ("spam".to_string(), 0.02)].into_iter().collect(),
+            ..Default::default()
+        };
+        let (s, a) = jev_risks(&j);
+        assert!((s - 0.02).abs() < 1e-9, "spam {s}");
+        assert!((a - 0.9).abs() < 1e-9, "abuse {a}");
+        // headline-class fallback when no spam-ish probabilities are present
+        let j = JevResult { class: "scam_phishing".into(), class_probs: [("legitimate".to_string(), 0.1)].into_iter().collect(), ..Default::default() };
+        assert!((jev_risks(&j).0 - 0.9).abs() < 1e-9);
+        // symmetric abuse fallback
+        let j = JevResult { class: "other_abuse".into(), ..Default::default() };
+        assert!((jev_risks(&j).1 - 1.0).abs() < 1e-9);
+        assert_eq!(jev_risks(&j).0, 0.0);
     }
 }

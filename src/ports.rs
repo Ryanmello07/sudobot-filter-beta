@@ -53,9 +53,21 @@ pub struct HttpImageFetcher {
     http: reqwest::Client,
 }
 
+/// Image fetches never follow redirects: a redirect would send us to an arbitrary
+/// host after the allowlist check on the original URL. The shared provider client
+/// keeps default redirect behavior; this one is built separately on purpose.
+fn fetch_client(timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent("sudobot-chat-guard/0.1")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client")
+}
+
 impl HttpImageFetcher {
     pub fn new() -> Self {
-        Self { http: crate::providers::http_client(std::time::Duration::from_secs(8)) }
+        Self { http: fetch_client(std::time::Duration::from_secs(8)) }
     }
 }
 
@@ -121,4 +133,25 @@ pub struct IncidentReport {
 pub trait ModLog: Send + Sync {
     async fn incident(&self, report: &IncidentReport);
     async fn notice(&self, guild: u64, text: &str);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // S1: the image fetcher's client must not follow redirects (a redirect would
+    // defeat the CDN host allowlist). wiremock can't stand in for an allowlisted
+    // host, so this asserts the client's redirect policy directly.
+    #[tokio::test]
+    async fn fetch_client_does_not_follow_redirects() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "http://evil.example/steal"))
+            .mount(&s)
+            .await;
+        let resp = fetch_client(std::time::Duration::from_secs(1)).get(s.uri()).send().await.unwrap();
+        assert_eq!(resp.status(), 302, "redirect must surface, not be followed");
+    }
 }

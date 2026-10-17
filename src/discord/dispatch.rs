@@ -5,7 +5,12 @@ use crate::model::Tier;
 use crate::pipeline::{IncomingMessage, Pipeline};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// How long a Quarantine-tier submit may wait for queue room before the message is
+/// shed. Bounded so a stuck worker can never hang serenity's event loop.
+const SUBMIT_WAIT: Duration = Duration::from_millis(50);
 
 pub struct Dispatcher {
     txs: Vec<mpsc::Sender<IncomingMessage>>,
@@ -33,6 +38,13 @@ impl Dispatcher {
         ((m.guild_id ^ m.author_id.rotate_left(17)) as usize) % self.txs.len()
     }
 
+    fn count_shed(&self) {
+        let n = self.shed.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(100) {
+            tracing::warn!("queue full; shed {n} messages so far");
+        }
+    }
+
     /// `base_tier` is the cheap, profile-only tier used to decide what may be shed.
     pub async fn submit(&self, m: IncomingMessage, base_tier: Tier) {
         let tx = &self.txs[self.shard(&m)];
@@ -40,13 +52,13 @@ impl Dispatcher {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(m)) => {
                 if base_tier == Tier::Quarantine {
-                    // Never shed Quarantine: wait for room.
-                    let _ = tx.send(m).await;
-                } else {
-                    let n = self.shed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == 1 || n.is_multiple_of(100) {
-                        tracing::warn!("queue full; shed {n} lower-tier messages so far");
+                    // Quarantine is shed last: wait a bounded time for room, but never
+                    // block the caller (the gateway event loop) indefinitely.
+                    if tokio::time::timeout(SUBMIT_WAIT, tx.send(m)).await.is_err() {
+                        self.count_shed();
                     }
+                } else {
+                    self.count_shed();
                 }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => tracing::error!("worker queue closed"),
@@ -68,13 +80,11 @@ mod tests {
         }
     }
 
-    // Regression S5: submitting to a full queue must never block the caller beyond a
-    // bounded time — the gateway task calling submit() must stay responsive. Today a
-    // Quarantine-tier message awaits tx.send() on a full channel, which hangs forever
-    // when the worker is stuck. The submit is spawned onto a task and wrapped in a
-    // timeout so the hang is detected instead of stalling the suite.
+    // Regression S5 (fixed): submitting to a full queue waits at most SUBMIT_WAIT
+    // (50ms) for Quarantine-tier messages before shedding, so the gateway task never
+    // hangs. The test bounds submit at 100ms; spawned + timed out so a hang would
+    // fail rather than stall the suite.
     #[tokio::test]
-    #[ignore = "S5: submit blocks indefinitely on a full queue for Quarantine-tier messages"]
     async fn s5_submit_to_full_queue_returns_within_bounds() {
         use super::Dispatcher;
         use crate::model::{MemberProfile, Tier};
