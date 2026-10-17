@@ -302,7 +302,9 @@ impl Pipeline {
 
         // ---- record ----
         let mut incident_id = None;
-        if planned >= Action::Flag {
+        // "already": the incident for this message exists and was actioned; do not
+        // overwrite its stored action_taken or post a second mod-log embed.
+        if planned >= Action::Flag && taken != "already" {
             let ni = NewIncident {
                 guild_id: g,
                 user_id: m.author_id,
@@ -1220,13 +1222,10 @@ mod tests {
     }
 
     // ---------- regression tests for audit findings (all #[ignore]d) ----------
-    // Regression M5: reprocessing an already-actioned message must not clobber the
-    // stored action_taken ("delete+timeout") with "already". insert_incident's
-    // ON CONFLICT upsert currently overwrites it, erasing the record of what was
-    // actually done. (FakeSink never really deletes, so the second pass reaches the
-    // record step — mirroring a redelivered gateway event.)
+    // Regression M5 (fixed): reprocessing an already-actioned message returns
+    // "already" and leaves the stored incident's action_taken untouched (no upsert,
+    // no second mod-log embed).
     #[tokio::test]
-    #[ignore = "M5: incident upsert overwrites action_taken with \"already\" on reprocessing"]
     async fn m5_reprocessing_does_not_overwrite_action_taken() {
         let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
         let m = msg(5, 7, "buy cheap stuff now", new_user(7));
