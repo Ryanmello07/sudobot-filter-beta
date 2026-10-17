@@ -13,6 +13,8 @@ pub struct State {
     pub pipeline: Arc<Pipeline>,
     pub dispatcher: Dispatcher,
     pub cfg: Arc<Config>,
+    /// Guild whose admins may manage other servers (`/guard config … guild:`).
+    pub manager_guild: Option<u64>,
 }
 
 #[derive(Default)]
@@ -49,7 +51,8 @@ impl EventHandler for Handler {
             Some(m) => (m.roles.clone(), m.joined_at),
             None => (vec![], None),
         };
-        let trusted = &st.cfg.guild(gid.get()).trusted_role_ids;
+        let gc = st.pipeline.effective_guild_config(gid.get()).await;
+        let trusted = &gc.trusted_role_ids;
         let Some(m) = build(
             &ctx.cache,
             trusted,
@@ -71,7 +74,7 @@ impl EventHandler for Handler {
         ) else {
             return;
         };
-        let tier = base_tier(&m.profile, &st.cfg.guild(gid.get()).tiers, chrono::Utc::now());
+        let tier = base_tier(&m.profile, &gc.tiers, chrono::Utc::now());
         st.dispatcher.submit(m, tier).await;
     }
 
@@ -87,7 +90,8 @@ impl EventHandler for Handler {
         }
         let empty_a: Vec<Attachment> = vec![];
         let empty_e: Vec<Embed> = vec![];
-        let trusted = &st.cfg.guild(gid.get()).trusted_role_ids;
+        let gc = st.pipeline.effective_guild_config(gid.get()).await;
+        let trusted = &gc.trusted_role_ids;
         let created = ev.timestamp.map(to_utc).unwrap_or_else(chrono::Utc::now);
         let Some(m) = build(
             &ctx.cache,
@@ -110,7 +114,7 @@ impl EventHandler for Handler {
         ) else {
             return;
         };
-        let tier = base_tier(&m.profile, &st.cfg.guild(gid.get()).tiers, chrono::Utc::now());
+        let tier = base_tier(&m.profile, &gc.tiers, chrono::Utc::now());
         st.dispatcher.submit(m, tier).await;
     }
 
@@ -143,7 +147,7 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         let Some(st) = self.state.get() else { return };
         match interaction {
-            Interaction::Command(c) if c.data.name == "guard" => interact::command(&ctx, &c, &st.pipeline, &st.dispatcher.shed).await,
+            Interaction::Command(c) if c.data.name == "guard" => interact::command(&ctx, &c, &st.pipeline, &st.dispatcher.shed, st.manager_guild).await,
             Interaction::Component(c) => interact::component(&ctx, &c, &st.pipeline).await,
             _ => {}
         }

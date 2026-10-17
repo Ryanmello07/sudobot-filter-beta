@@ -1,11 +1,12 @@
 //! Configuration: `config.toml` for behavior, environment for secrets.
 
+use crate::model::Mode;
 use crate::secret::Secret;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TierConfig {
     pub quarantine_minutes_in_guild: i64,
     pub quarantine_account_hours: i64,
@@ -26,8 +27,8 @@ impl Default for TierConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuleWeights {
     pub flood: f64,
     pub duplicate: f64,
@@ -54,8 +55,8 @@ impl Default for RuleWeights {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuleConfig {
     pub flood_messages: usize,
     pub flood_seconds: i64,
@@ -78,8 +79,8 @@ impl Default for RuleConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FusionConfig {
     pub w_local: f64,
     pub w_paxmod: f64,
@@ -92,8 +93,8 @@ impl Default for FusionConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PlanConfig {
     pub local_hit_threshold: f64,
     pub fresh_sample_rate: f64,
@@ -107,13 +108,18 @@ impl Default for PlanConfig {
 }
 
 /// Fused-score thresholds for one tier. `None` disables the rung for that tier.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Rungs {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub flag: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delete: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kick: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ban: Option<f64>,
 }
 
@@ -129,8 +135,8 @@ impl Default for Rungs {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct LadderConfig {
     pub quarantine: Rungs,
     pub fresh: Rungs,
@@ -165,9 +171,10 @@ impl Default for LadderConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GuildConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub log_channel_id: Option<u64>,
     pub trusted_role_ids: Vec<u64>,
     pub allowlisted_user_ids: Vec<u64>,
@@ -302,14 +309,282 @@ impl Config {
         anyhow::ensure!((7..=30).contains(&self.runtime.retention_days), "runtime.retention_days must be 7-30");
         anyhow::ensure!(self.runtime.workers >= 1 && self.runtime.queue_size >= self.runtime.workers, "bad worker/queue sizes");
         for g in std::iter::once(&self.defaults).chain(self.guilds.values()) {
-            for r in [&g.ladder.quarantine, &g.ladder.fresh, &g.ladder.established] {
-                for v in [r.flag, r.delete, r.timeout, r.kick, r.ban].into_iter().flatten() {
-                    anyhow::ensure!((0.0..=1.0).contains(&v), "ladder threshold {v} out of range");
-                }
-            }
+            validate_guild(g)?;
         }
         Ok(())
     }
+
+    /// The effective config for a guild: [defaults] merged with [guild.<id>] (done at
+    /// load) further deep-merged with the guild's DB override doc. A ladder rung set
+    /// to the string "off" in the override doc disables that rung (TOML has no null).
+    pub fn apply_override(&self, guild: u64, doc: &str) -> anyhow::Result<GuildConfig> {
+        let mut over: toml::Table = toml::from_str(doc).map_err(|e| anyhow::anyhow!("override doc does not parse: {e}"))?;
+        let disabled = take_disabled_rungs(&mut over);
+        let base = toml::Value::try_from(self.guild(guild)).map_err(|e| anyhow::anyhow!("cannot serialize static config: {e}"))?;
+        let toml::Value::Table(mut base) = base else { anyhow::bail!("static config is not a table") };
+        merge_tables(&mut base, &over);
+        let mut g: GuildConfig = toml::Value::Table(base).try_into().map_err(|e| anyhow::anyhow!("override is invalid: {e}"))?;
+        for (tier, rung) in disabled {
+            let r = match tier.as_str() {
+                "quarantine" => &mut g.ladder.quarantine,
+                "fresh" => &mut g.ladder.fresh,
+                _ => &mut g.ladder.established,
+            };
+            match rung.as_str() {
+                "flag" => r.flag = None,
+                "delete" => r.delete = None,
+                "timeout" => r.timeout = None,
+                "kick" => r.kick = None,
+                _ => r.ban = None,
+            }
+        }
+        validate_guild(&g)?;
+        Ok(g)
+    }
+}
+
+fn validate_guild(g: &GuildConfig) -> anyhow::Result<()> {
+    for r in [&g.ladder.quarantine, &g.ladder.fresh, &g.ladder.established] {
+        for v in [r.flag, r.delete, r.timeout, r.kick, r.ban].into_iter().flatten() {
+            anyhow::ensure!((0.0..=1.0).contains(&v), "ladder threshold {v} out of range");
+        }
+    }
+    for (name, v) in [
+        ("plan.local_hit_threshold", g.plan.local_hit_threshold),
+        ("plan.fresh_sample_rate", g.plan.fresh_sample_rate),
+        ("plan.established_sample_rate", g.plan.established_sample_rate),
+        ("fusion.w_local", g.fusion.w_local),
+        ("fusion.w_paxmod", g.fusion.w_paxmod),
+        ("fusion.w_jev", g.fusion.w_jev),
+    ] {
+        anyhow::ensure!((0.0..=1.0).contains(&v), "{name} must be between 0 and 1");
+    }
+    Ok(())
+}
+
+/// Pull "off" sentinels out of ladder.<tier>.<rung> entries before merging; the
+/// caller turns them into `None` rungs after deserialization.
+fn take_disabled_rungs(over: &mut toml::Table) -> Vec<(String, String)> {
+    let mut out = vec![];
+    let Some(toml::Value::Table(ladder)) = over.get_mut("ladder") else { return out };
+    for (tier, tv) in ladder.iter_mut() {
+        let toml::Value::Table(tt) = tv else { continue };
+        let off: Vec<String> = tt
+            .iter()
+            .filter(|(_, v)| matches!(v, toml::Value::String(s) if s == RUNG_DISABLED))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for rung in off {
+            tt.remove(&rung);
+            out.push((tier.clone(), rung));
+        }
+    }
+    out
+}
+
+// ---------- runtime override editing (`/guard config set|reset`) ----------
+
+/// Sentinel stored in an override doc for a disabled ladder rung.
+const RUNG_DISABLED: &str = "off";
+
+const LIST_STR_KEYS: &[&str] = &["blocked_domains", "allowed_invites"];
+const LIST_ID_KEYS: &[&str] = &["trusted_role_ids", "allowlisted_user_ids"];
+const LADDER_TIERS: &[&str] = &["quarantine", "fresh", "established"];
+const LADDER_RUNGS: &[&str] = &["flag", "delete", "timeout", "kick", "ban"];
+const FLOAT_KEYS: &[&str] = &[
+    "plan.local_hit_threshold",
+    "plan.fresh_sample_rate",
+    "plan.established_sample_rate",
+    "fusion.w_local",
+    "fusion.w_paxmod",
+    "fusion.w_jev",
+];
+
+/// Keys `/guard config set` and `reset` accept (`log_channel_id` is handled
+/// separately, stored in guild_state like `/guard logchannel`).
+pub const OVERRIDE_KEYS: &[&str] = &[
+    "blocked_domains",
+    "allowed_invites",
+    "trusted_role_ids",
+    "allowlisted_user_ids",
+    "ladder.<tier>.<rung>",
+    "plan.local_hit_threshold",
+    "plan.fresh_sample_rate",
+    "plan.established_sample_rate",
+    "fusion.w_local",
+    "fusion.w_paxmod",
+    "fusion.w_jev",
+];
+
+fn parse_doc(doc: Option<&str>) -> anyhow::Result<toml::Table> {
+    match doc {
+        Some(d) if !d.trim().is_empty() => Ok(toml::from_str(d).map_err(|e| anyhow::anyhow!("stored override does not parse: {e}"))?),
+        _ => Ok(toml::Table::new()),
+    }
+}
+
+fn nested<'a>(t: &'a mut toml::Table, section: &str) -> anyhow::Result<&'a mut toml::Table> {
+    let v = t.entry(section.to_string()).or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    v.as_table_mut().ok_or_else(|| anyhow::anyhow!("{section} is not a table in the stored override"))
+}
+
+/// Serialize an override table in a canonical order (TOML wants values before tables).
+fn finish_doc(t: toml::Table) -> anyhow::Result<String> {
+    const ORDER: &[&str] = &["blocked_domains", "allowed_invites", "trusted_role_ids", "allowlisted_user_ids", "ladder", "plan", "fusion"];
+    let mut out = toml::Table::new();
+    for k in ORDER {
+        if let Some(v) = t.get(*k) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    debug_assert_eq!(out.len(), t.len(), "unknown keys should have been rejected earlier");
+    if out.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(toml::to_string(&toml::Value::Table(out))?)
+}
+
+fn parse_float(key: &str, value: &str) -> anyhow::Result<f64> {
+    let f: f64 = value.parse().map_err(|_| anyhow::anyhow!("{key}: {value:?} is not a number"))?;
+    anyhow::ensure!((0.0..=1.0).contains(&f), "{key} must be between 0 and 1");
+    Ok(f)
+}
+
+/// Set one curated key in a guild override doc, returning the new doc. An empty
+/// `value` on a ladder rung disables that rung; on a list key it clears the list.
+pub fn override_set(doc: Option<&str>, key: &str, value: &str) -> anyhow::Result<String> {
+    let mut t = parse_doc(doc)?;
+    let value = value.trim();
+    if LIST_STR_KEYS.contains(&key) {
+        let items: Vec<&str> = value.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        for it in &items {
+            anyhow::ensure!(!it.chars().any(char::is_whitespace), "{key}: {it:?} must not contain spaces");
+        }
+        t.insert(key.to_string(), toml::Value::Array(items.into_iter().map(|s| toml::Value::String(s.to_string())).collect()));
+    } else if LIST_ID_KEYS.contains(&key) {
+        let mut ids = vec![];
+        for part in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let id: u64 = part.parse().map_err(|_| anyhow::anyhow!("{key}: {part:?} is not a valid Discord ID"))?;
+            anyhow::ensure!(id <= i64::MAX as u64, "{key}: {part:?} does not fit the storage format");
+            ids.push(toml::Value::Integer(id as i64));
+        }
+        t.insert(key.to_string(), toml::Value::Array(ids));
+    } else if let Some(rest) = key.strip_prefix("ladder.") {
+        let (tier, rung) = rest.split_once('.').ok_or_else(|| anyhow::anyhow!("ladder keys look like ladder.<tier>.<rung>"))?;
+        anyhow::ensure!(LADDER_TIERS.contains(&tier), "unknown tier {tier:?} (quarantine, fresh, established)");
+        anyhow::ensure!(LADDER_RUNGS.contains(&rung), "unknown rung {rung:?} (flag, delete, timeout, kick, ban)");
+        let tt = nested(nested(&mut t, "ladder")?, tier)?;
+        if value.is_empty() {
+            tt.insert(rung.to_string(), toml::Value::String(RUNG_DISABLED.into()));
+        } else {
+            tt.insert(rung.to_string(), toml::Value::Float(parse_float(key, value)?));
+        }
+    } else if FLOAT_KEYS.contains(&key) {
+        let (section, name) = key.split_once('.').unwrap();
+        let f = parse_float(key, value)?;
+        nested(&mut t, section)?.insert(name.to_string(), toml::Value::Float(f));
+    } else {
+        anyhow::bail!("unknown key {key:?}; supported keys: {}", OVERRIDE_KEYS.join(", "));
+    }
+    finish_doc(t)
+}
+
+/// Remove one curated key from a guild override doc (the value falls back to the
+/// static config). Returns the new doc, possibly empty.
+pub fn override_reset(doc: Option<&str>, key: &str) -> anyhow::Result<String> {
+    let mut t = parse_doc(doc)?;
+    if LIST_STR_KEYS.contains(&key) || LIST_ID_KEYS.contains(&key) {
+        t.remove(key);
+    } else if let Some(rest) = key.strip_prefix("ladder.") {
+        let (tier, rung) = rest.split_once('.').ok_or_else(|| anyhow::anyhow!("ladder keys look like ladder.<tier>.<rung>"))?;
+        anyhow::ensure!(LADDER_TIERS.contains(&tier), "unknown tier {tier:?}");
+        anyhow::ensure!(LADDER_RUNGS.contains(&rung), "unknown rung {rung:?}");
+        if let Some(toml::Value::Table(l)) = t.get_mut("ladder") {
+            if let Some(toml::Value::Table(tt)) = l.get_mut(tier) {
+                tt.remove(rung);
+            }
+        }
+    } else if FLOAT_KEYS.contains(&key) {
+        let (section, name) = key.split_once('.').unwrap();
+        if let Some(toml::Value::Table(st)) = t.get_mut(section) {
+            st.remove(name);
+        }
+    } else {
+        anyhow::bail!("unknown key {key:?}; supported keys: {}", OVERRIDE_KEYS.join(", "));
+    }
+    finish_doc(t)
+}
+
+/// Human-readable current value of a curated key in an effective config.
+pub fn describe_key(g: &GuildConfig, key: &str) -> String {
+    let list = |xs: &[String]| if xs.is_empty() { "(empty)".to_string() } else { xs.join(", ") };
+    let ids = |xs: &[u64]| if xs.is_empty() { "(empty)".to_string() } else { xs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ") };
+    let rung_fmt = |v: Option<f64>| v.map(|f| format!("{f:.2}")).unwrap_or_else(|| "off".into());
+    match key {
+        "blocked_domains" => list(&g.blocked_domains),
+        "allowed_invites" => list(&g.allowed_invites),
+        "trusted_role_ids" => ids(&g.trusted_role_ids),
+        "allowlisted_user_ids" => ids(&g.allowlisted_user_ids),
+        "plan.local_hit_threshold" => format!("{:.2}", g.plan.local_hit_threshold),
+        "plan.fresh_sample_rate" => format!("{:.2}", g.plan.fresh_sample_rate),
+        "plan.established_sample_rate" => format!("{:.2}", g.plan.established_sample_rate),
+        "fusion.w_local" => format!("{:.2}", g.fusion.w_local),
+        "fusion.w_paxmod" => format!("{:.2}", g.fusion.w_paxmod),
+        "fusion.w_jev" => format!("{:.2}", g.fusion.w_jev),
+        _ => key
+            .strip_prefix("ladder.")
+            .and_then(|r| r.split_once('.'))
+            .map(|(tier, rung)| {
+                let r = match tier {
+                    "quarantine" => &g.ladder.quarantine,
+                    "fresh" => &g.ladder.fresh,
+                    _ => &g.ladder.established,
+                };
+                match rung {
+                    "flag" => rung_fmt(r.flag),
+                    "delete" => rung_fmt(r.delete),
+                    "timeout" => rung_fmt(r.timeout),
+                    "kick" => rung_fmt(r.kick),
+                    _ => rung_fmt(r.ban),
+                }
+            })
+            .unwrap_or_else(|| "?".into()),
+    }
+}
+
+/// Human-readable summary of a guild's effective config, for `/guard config show`.
+pub fn config_summary(mode: Mode, log_channel: Option<u64>, has_override: bool, g: &GuildConfig) -> String {
+    let rungs = |name: &str, r: &Rungs| {
+        let r2 = |v: Option<f64>| v.map(|f| format!("{f:.2}")).unwrap_or_else(|| "off".into());
+        format!(
+            "{name}: flag {} delete {} timeout {} kick {} ban {}",
+            r2(r.flag),
+            r2(r.delete),
+            r2(r.timeout),
+            r2(r.kick),
+            r2(r.ban)
+        )
+    };
+    let list = |name: &str, xs: &[String]| format!("{name}: {}", if xs.is_empty() { "(none)".into() } else { xs.join(", ") });
+    let ids = |name: &str, xs: &[u64]| format!("{name}: {}", if xs.is_empty() { "(none)".into() } else { xs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ") });
+    [
+        format!("Mode: **{}**", mode.as_str()),
+        format!("Mod-log channel: {}", log_channel.map(|c| format!("<#{c}>")).unwrap_or_else(|| "not set".into())),
+        format!("DB override: {}", if has_override { "yes" } else { "no" }),
+        list("Blocked domains", &g.blocked_domains),
+        list("Allowed invites", &g.allowed_invites),
+        ids("Trusted roles", &g.trusted_role_ids),
+        ids("Allowlisted users", &g.allowlisted_user_ids),
+        rungs("Quarantine", &g.ladder.quarantine),
+        rungs("Fresh", &g.ladder.fresh),
+        rungs("Established", &g.ladder.established),
+        format!(
+            "Plan: local hit {:.2}, fresh sample {:.2}, established sample {:.2}",
+            g.plan.local_hit_threshold, g.plan.fresh_sample_rate, g.plan.established_sample_rate
+        ),
+        format!("Fusion weights: local {:.2}, paxmod {:.2}, jev {:.2}", g.fusion.w_local, g.fusion.w_paxmod, g.fusion.w_jev),
+    ]
+    .join("\n")
 }
 
 fn merge_tables(base: &mut toml::Table, over: &toml::Table) {
@@ -344,6 +619,8 @@ pub struct Env {
     pub reserved_share: f64,
     pub database_url: String,
     pub config_path: String,
+    /// Guild whose admins may manage other servers' configs (`/guard config … guild:`).
+    pub manager_guild_id: Option<u64>,
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -382,6 +659,13 @@ impl Env {
             reserved_share,
             database_url: var("DATABASE_URL", "sqlite://data/guard.db"),
             config_path: var("CONFIG_PATH", "config.toml"),
+            manager_guild_id: match std::env::var("MANAGER_GUILD_ID") {
+                Ok(v) if !v.trim().is_empty() => {
+                    let id: u64 = v.trim().parse().map_err(|_| anyhow::anyhow!("MANAGER_GUILD_ID is not a valid guild ID"))?;
+                    Some(id)
+                }
+                _ => None,
+            },
         })
     }
 }
@@ -434,5 +718,114 @@ mod tests {
     fn context_feed_parses() {
         let c = Config::from_toml_str("[paxmod]\ncontext_feed = \"all\"\n").unwrap();
         assert_eq!(c.paxmod.context_feed, ContextFeed::All);
+    }
+
+    #[test]
+    fn override_set_lists_ids_floats_and_rungs() {
+        let d = override_set(None, "blocked_domains", "evil.com, scam.xyz").unwrap();
+        let d = override_set(Some(&d), "trusted_role_ids", "123, 456").unwrap();
+        let d = override_set(Some(&d), "plan.local_hit_threshold", "0.5").unwrap();
+        let d = override_set(Some(&d), "ladder.fresh.kick", "0.9").unwrap();
+        let d = override_set(Some(&d), "ladder.quarantine.ban", "").unwrap(); // empty disables the rung
+        let c = Config::from_toml_str("").unwrap();
+        let g = c.apply_override(1, &d).unwrap();
+        assert_eq!(g.blocked_domains, ["evil.com", "scam.xyz"]);
+        assert_eq!(g.trusted_role_ids, [123, 456]);
+        assert_eq!(g.plan.local_hit_threshold, 0.5);
+        assert_eq!(g.ladder.fresh.kick, Some(0.9));
+        assert_eq!(g.ladder.quarantine.ban, None, "disabled rung");
+        assert_eq!(g.ladder.quarantine.kick, Some(0.85), "untouched rung keeps its default");
+    }
+
+    #[test]
+    fn override_set_rejects_bad_input() {
+        assert!(override_set(None, "nonsense", "1").is_err(), "unknown key");
+        assert!(override_set(None, "log_channel_id", "123").is_err(), "handled via guild_state, not the doc");
+        assert!(override_set(None, "plan.local_hit_threshold", "1.5").is_err(), "out of range");
+        assert!(override_set(None, "plan.local_hit_threshold", "abc").is_err(), "not a float");
+        assert!(override_set(None, "ladder.fresh.kick", "2").is_err());
+        assert!(override_set(None, "ladder.nope.kick", "0.5").is_err(), "bad tier");
+        assert!(override_set(None, "ladder.fresh.smite", "0.5").is_err(), "bad rung");
+        assert!(override_set(None, "ladder.fresh", "0.5").is_err(), "missing rung");
+        assert!(override_set(None, "trusted_role_ids", "12x").is_err(), "bad snowflake");
+        assert!(override_set(None, "blocked_domains", "evil domain.com").is_err(), "space in domain");
+    }
+
+    #[test]
+    fn override_reset_removes_key_and_falls_back() {
+        let d = override_set(None, "blocked_domains", "evil.com").unwrap();
+        let d = override_set(Some(&d), "plan.local_hit_threshold", "0.5").unwrap();
+        let d = override_reset(Some(&d), "blocked_domains").unwrap();
+        let c = Config::from_toml_str("").unwrap();
+        let g = c.apply_override(1, &d).unwrap();
+        assert!(g.blocked_domains.is_empty(), "reset falls back to static (empty) list");
+        assert_eq!(g.plan.local_hit_threshold, 0.5, "other keys survive the reset");
+        assert!(override_reset(None, "blocked_domains").unwrap().is_empty(), "reset on empty doc");
+        assert!(override_reset(None, "bogus",).is_err());
+    }
+
+    #[test]
+    fn apply_override_merge_order_db_beats_static_beats_default() {
+        let c = Config::from_toml_str(
+            "[defaults]\nblocked_domains = [\"default.com\"]\n[guild.7]\nblocked_domains = [\"static.com\"]\n[guild.7.plan]\nlocal_hit_threshold = 0.4\n",
+        )
+        .unwrap();
+        assert_eq!(c.apply_override(1, "").unwrap().blocked_domains, ["default.com"], "defaults only");
+        assert_eq!(c.apply_override(7, "").unwrap().blocked_domains, ["static.com"], "static [guild.7] beats defaults");
+        let d = override_set(None, "blocked_domains", "db.com").unwrap();
+        let g = c.apply_override(7, &d).unwrap();
+        assert_eq!(g.blocked_domains, ["db.com"], "DB doc beats static");
+        assert_eq!(g.plan.local_hit_threshold, 0.4, "static merge preserved under the DB override");
+    }
+
+    #[test]
+    fn apply_override_rejects_unknown_keys_and_bad_values() {
+        let c = Config::from_toml_str("").unwrap();
+        assert!(c.apply_override(1, "nonsense_key = 1").is_err(), "unknown key");
+        assert!(c.apply_override(1, "[ladder.fresh]\nkick = 1.5").is_err(), "out of range");
+        assert!(c.apply_override(1, "not toml = [").is_err(), "unparseable");
+        assert!(c.apply_override(1, "ladder = 42").is_err(), "wrong type");
+    }
+
+    #[test]
+    fn apply_override_disabled_rung_survives_merge() {
+        let c = Config::from_toml_str("").unwrap();
+        let g = c.apply_override(1, "[ladder.fresh]\nkick = \"off\"").unwrap();
+        assert_eq!(g.ladder.fresh.kick, None);
+        assert_eq!(g.ladder.fresh.ban, Some(0.97));
+    }
+
+    #[test]
+    fn config_summary_smoke() {
+        let g = GuildConfig::default();
+        let s = config_summary(Mode::Observe, Some(42), true, &g);
+        assert!(s.contains("observe") && s.contains("<#42>") && s.contains("Quarantine") && s.contains("Fusion weights"));
+        assert!(s.contains("DB override: yes"));
+    }
+
+    // Regression C1: a [defaults.ladder.established] table that omits kick/ban must
+    // leave those rungs DISABLED (None). The container-level `#[serde(default)]` on
+    // Rungs currently fills missing fields from Rungs::default() (Some(0.92) /
+    // Some(0.97)), silently enabling kick and ban for established members.
+    #[test]
+    #[ignore = "C1: container-level serde default fills established.kick/ban with Some(0.92)/Some(0.97) instead of None"]
+    fn c1_omitted_established_kick_ban_stay_disabled() {
+        let c = Config::from_toml_str(
+            "[defaults.ladder.established]\nflag = 0.65\ndelete = 0.85\ntimeout = 0.92\n",
+        )
+        .unwrap();
+        let e = &c.guild(1).ladder.established;
+        assert_eq!((e.kick, e.ban), (None, None));
+    }
+
+    // Regression C1, against the shipped config.toml: it omits kick/ban under
+    // [defaults.ladder.established], so both must deserialize to None.
+    #[test]
+    #[ignore = "C1: shipped config.toml omits established kick/ban but deserialization enables them"]
+    fn c1_shipped_config_keeps_established_kick_ban_disabled() {
+        let s = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap();
+        let c = Config::from_toml_str(&s).unwrap();
+        let e = &c.guild(1).ladder.established;
+        assert_eq!((e.kick, e.ban), (None, None));
     }
 }

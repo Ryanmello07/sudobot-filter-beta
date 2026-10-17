@@ -66,13 +66,13 @@ async fn main() -> anyhow::Result<()> {
         ocr: Arc::new(OcrClient::new(&env.ocr_base, env.ocr_key.clone(), env.ocr_engine, Duration::from_millis(env.ocr_timeout_ms))),
         fetcher: Arc::new(HttpImageFetcher::new()),
         sink: Arc::new(DiscordSink { http: client.http.clone(), cache: client.cache.clone() }),
-        modlog: Arc::new(DiscordModLog { http: client.http.clone(), cfg: cfg.clone() }),
+        modlog: Arc::new(DiscordModLog { http: client.http.clone(), cfg: cfg.clone(), store: store.clone() }),
         budgets,
         ocr_max_upload: env.ocr_max_upload_bytes,
         roll: Arc::new(rand::random::<f64>),
     }));
     let dispatcher = Dispatcher::start(pipeline.clone(), cfg.runtime.workers, cfg.runtime.queue_size);
-    if handler.state.set(State { pipeline: pipeline.clone(), dispatcher, cfg: cfg.clone() }).is_err() {
+    if handler.state.set(State { pipeline: pipeline.clone(), dispatcher, cfg: cfg.clone(), manager_guild: env.manager_guild_id }).is_err() {
         anyhow::bail!("state already set");
     }
 

@@ -229,4 +229,58 @@ mod tests {
         assert!(v.evidence.iter().any(|e| e.starts_with("paxmod:Spam")));
         assert!(!v.evidence.iter().any(|e| e.contains("Harassment")));
     }
+
+    // Regression M1: the fused score is capped by the source weight. A local-only
+    // verdict can never exceed w_local (0.6), and any realistic local score lands
+    // just UNDER the quarantine delete threshold (0.60): every rule firing at once
+    // gives a local score of ~0.9994, fusing to ~0.5996. So the strongest possible
+    // local-only detection can delete only after floating-point luck, and realistic
+    // maximal detections never can. Desired: a maximal local-only score reaches at
+    // least the quarantine delete threshold.
+    #[test]
+    #[ignore = "M1: single-source fused score is capped below the quarantine delete threshold"]
+    fn m1_local_only_max_score_reaches_quarantine_delete_threshold() {
+        let delete = crate::config::LadderConfig::default().quarantine.delete.unwrap();
+        // Sanity floor: an idealized local score of exactly 1.0 fuses to w_local.
+        let perfect = LocalResult::from_signals(vec![Signal { name: "x".into(), weight: 1.0 }]);
+        let v = fuse(&Inputs { local: Some(&perfect), ..Default::default() }, &cfg(), 0.4);
+        assert!(v.score >= delete, "perfect local score fuses to {:.6}, below delete {delete}", v.score);
+        // The realistic ceiling: every local rule firing at full weight.
+        let w = crate::config::RuleWeights::default();
+        let maxed = LocalResult::from_signals(vec![
+            Signal { name: "flood".into(), weight: w.flood },
+            Signal { name: "duplicate".into(), weight: w.duplicate },
+            Signal { name: "mass_mention".into(), weight: w.mass_mention },
+            Signal { name: "everyone_attempt".into(), weight: w.everyone_attempt },
+            Signal { name: "first_message_link".into(), weight: w.first_message_link },
+            Signal { name: "invite_link".into(), weight: w.invite_link },
+            Signal { name: "blocked_domain".into(), weight: w.blocked_domain },
+            Signal { name: "image_text_bait".into(), weight: w.image_text_bait },
+        ]);
+        let v = fuse(&Inputs { local: Some(&maxed), ..Default::default() }, &cfg(), 0.4);
+        assert!(v.score >= delete, "max local score {:.4} fuses to {:.6}, below delete {delete}", maxed.score, v.score);
+    }
+
+    // Regression M4: a Jev-only other_abuse verdict should be labeled Abuse. Today the
+    // spam term (1 - p_legitimate = 0.95, weighted 0.855) outweighs the abuse term
+    // (0.9, weighted 0.81), so the message is mislabeled Spam.
+    #[test]
+    #[ignore = "M4: Jev-only other_abuse is labeled Spam instead of Abuse"]
+    fn m4_jev_only_other_abuse_is_labeled_abuse() {
+        let j = JevResult {
+            class: "other_abuse".into(),
+            class_probs: [
+                ("legitimate".to_string(), 0.05),
+                ("other_abuse".to_string(), 0.9),
+                ("dm_lure".to_string(), 0.0),
+                ("crypto_giveaway".to_string(), 0.0),
+                ("evasion".to_string(), 0.0),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let v = fuse(&Inputs { jev: Some(&j), ..Default::default() }, &cfg(), 0.4);
+        assert_eq!(v.label, Label::Abuse, "spam {:.3} abuse {:.3}", v.spam_score, v.abuse_score);
+    }
 }

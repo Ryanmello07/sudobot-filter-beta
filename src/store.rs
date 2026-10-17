@@ -27,6 +27,15 @@ pub struct IncidentRow {
     pub text_excerpt: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GuildOverview {
+    pub guild_id: u64,
+    pub mode: Mode,
+    pub log_channel_id: Option<u64>,
+    pub has_override: bool,
+    pub incidents: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NewIncident {
     pub guild_id: u64,
@@ -97,6 +106,109 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Per-guild mod-log channel override, set at runtime via `/guard logchannel`.
+    pub async fn set_log_channel(&self, guild: u64, channel: u64, by: u64) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO guild_state (guild_id, log_channel_id, updated_by, updated_at) VALUES (?,?,?,?)
+             ON CONFLICT(guild_id) DO UPDATE SET log_channel_id=excluded.log_channel_id, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        )
+        .bind(guild as i64)
+        .bind(channel as i64)
+        .bind(by as i64)
+        .bind(ts(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The DB override for the guild's mod-log channel. Fail-safe: None on error.
+    pub async fn log_channel(&self, guild: u64) -> Option<u64> {
+        sqlx::query("SELECT log_channel_id FROM guild_state WHERE guild_id = ?")
+            .bind(guild as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get::<Option<i64>, _>("log_channel_id"))
+            .map(|c| c as u64)
+    }
+
+    pub async fn clear_log_channel(&self, guild: u64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE guild_state SET log_channel_id = NULL WHERE guild_id = ?").bind(guild as i64).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // ---- guild config overrides (`/guard config set|reset`) ----
+
+    /// Store the per-guild override TOML doc. Caller must have validated it already
+    /// (see `Config::apply_override`).
+    pub async fn set_guild_override(&self, guild: u64, toml_doc: &str, by: u64) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO guild_overrides (guild_id, toml, updated_by, updated_at) VALUES (?,?,?,?)
+             ON CONFLICT(guild_id) DO UPDATE SET toml=excluded.toml, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        )
+        .bind(guild as i64)
+        .bind(toml_doc)
+        .bind(by as i64)
+        .bind(ts(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The guild's override TOML doc, if any. Fail-safe: None on error.
+    pub async fn guild_override(&self, guild: u64) -> Option<String> {
+        sqlx::query("SELECT toml FROM guild_overrides WHERE guild_id = ?")
+            .bind(guild as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.get::<String, _>("toml"))
+    }
+
+    pub async fn clear_guild_override(&self, guild: u64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM guild_overrides WHERE guild_id = ?").bind(guild as i64).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// One row per guild that has any guard state, for `/guard guilds`.
+    pub async fn guild_overview(&self) -> anyhow::Result<Vec<GuildOverview>> {
+        use std::collections::{HashMap, HashSet};
+        let states = sqlx::query("SELECT guild_id, mode, log_channel_id FROM guild_state").fetch_all(&self.pool).await?;
+        let overrides = sqlx::query("SELECT guild_id FROM guild_overrides").fetch_all(&self.pool).await?;
+        let incidents = sqlx::query("SELECT guild_id, COUNT(*) AS c FROM incidents GROUP BY guild_id").fetch_all(&self.pool).await?;
+
+        let with_override: HashSet<i64> = overrides.iter().map(|r| r.get::<i64, _>("guild_id")).collect();
+        let mut by_guild: HashMap<i64, GuildOverview> = HashMap::new();
+        for r in states {
+            let g = r.get::<i64, _>("guild_id");
+            by_guild.insert(
+                g,
+                GuildOverview {
+                    guild_id: g as u64,
+                    mode: Mode::parse(r.get::<String, _>("mode").as_str()).unwrap_or(Mode::Observe),
+                    log_channel_id: r.get::<Option<i64>, _>("log_channel_id").map(|c| c as u64),
+                    has_override: with_override.contains(&g),
+                    incidents: 0,
+                },
+            );
+        }
+        for r in incidents {
+            let g = r.get::<i64, _>("guild_id");
+            by_guild
+                .entry(g)
+                .or_insert_with(|| GuildOverview { guild_id: g as u64, mode: Mode::Observe, log_channel_id: None, has_override: with_override.contains(&g), incidents: 0 })
+                .incidents = r.get::<i64, _>("c");
+        }
+        for g in &with_override {
+            by_guild.entry(*g).or_insert_with(|| GuildOverview { guild_id: *g as u64, mode: Mode::Observe, log_channel_id: None, has_override: true, incidents: 0 });
+        }
+        let mut out: Vec<GuildOverview> = by_guild.into_values().collect();
+        out.sort_by_key(|o| o.guild_id);
+        Ok(out)
     }
 
     // ---- members ----
@@ -375,6 +487,63 @@ mod tests {
         assert_eq!(s.mode(2).await, Mode::Observe);
         s.set_mode(1, Mode::Observe, 9).await.unwrap();
         assert_eq!(s.mode(1).await, Mode::Observe);
+    }
+
+    #[tokio::test]
+    async fn log_channel_round_trip_and_unset_is_none() {
+        let s = Store::memory().await.unwrap();
+        // unset returns None
+        assert_eq!(s.log_channel(1).await, None);
+        // set/get round-trip
+        s.set_log_channel(1, 99, 7).await.unwrap();
+        assert_eq!(s.log_channel(1).await, Some(99));
+        // overwrite wins
+        s.set_log_channel(1, 100, 7).await.unwrap();
+        assert_eq!(s.log_channel(1).await, Some(100));
+        // per-guild isolation
+        assert_eq!(s.log_channel(2).await, None);
+        // setting the log channel must not clobber the mode, and vice versa
+        s.set_mode(1, Mode::Enforce, 7).await.unwrap();
+        assert_eq!(s.log_channel(1).await, Some(100));
+        assert_eq!(s.mode(1).await, Mode::Enforce);
+        // clear falls back to None
+        s.clear_log_channel(1).await.unwrap();
+        assert_eq!(s.log_channel(1).await, None);
+    }
+
+    #[tokio::test]
+    async fn guild_override_round_trip_and_clear() {
+        let s = Store::memory().await.unwrap();
+        assert_eq!(s.guild_override(1).await, None);
+        s.set_guild_override(1, "blocked_domains = [\"evil.com\"]", 7).await.unwrap();
+        assert_eq!(s.guild_override(1).await.as_deref(), Some("blocked_domains = [\"evil.com\"]"));
+        s.set_guild_override(1, "plan.local_hit_threshold = 0.5", 8).await.unwrap();
+        assert_eq!(s.guild_override(1).await.as_deref(), Some("plan.local_hit_threshold = 0.5"));
+        assert_eq!(s.guild_override(2).await, None);
+        s.clear_guild_override(1).await.unwrap();
+        assert_eq!(s.guild_override(1).await, None);
+    }
+
+    #[tokio::test]
+    async fn guild_overview_combines_state_overrides_and_incidents() {
+        let s = Store::memory().await.unwrap();
+        let t = now();
+        assert!(s.guild_overview().await.unwrap().is_empty());
+        s.set_mode(1, Mode::Enforce, 9).await.unwrap();
+        s.set_log_channel(1, 55, 9).await.unwrap();
+        s.set_guild_override(2, "blocked_domains = []", 9).await.unwrap();
+        let i = NewIncident { guild_id: 1, message_id: 4, tier: "fresh".into(), label: "spam".into(), score: 0.8, action_planned: "delete".into(), action_taken: "delete".into(), outcome: "open".into(), verdict_json: "{}".into(), local_signals: "[]".into(), ..Default::default() };
+        s.insert_incident(&i, t).await.unwrap();
+        let rows = s.guild_overview().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].guild_id, 1);
+        assert_eq!(rows[0].mode, Mode::Enforce);
+        assert_eq!(rows[0].log_channel_id, Some(55));
+        assert_eq!(rows[0].incidents, 1);
+        assert!(!rows[0].has_override);
+        assert_eq!(rows[1].guild_id, 2);
+        assert!(rows[1].has_override);
+        assert_eq!(rows[1].incidents, 0);
     }
 
     #[tokio::test]

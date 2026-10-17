@@ -4,6 +4,8 @@
 #
 # Every value below is the built-in default except where noted; delete what you do
 # not change. Per-guild overrides go under [guild.<guild id>] and merge over [defaults].
+# Most per-guild settings can also be changed at runtime with `/guard config set`
+# (stored in the database, winning over both [guild.<id>] and [defaults]).
 
 [runtime]
 queue_size = 256            # total pending messages across workers
@@ -28,7 +30,8 @@ min_text_chars = 4
 cache_ttl_secs = 3600
 
 [defaults]
-# REQUIRED for useful mod-log output: set your log channel ID.
+# Default mod-log channel; per guild it can be set at runtime with
+# `/guard logchannel #channel` (stored in the DB, wins over this value).
 # log_channel_id = 123456789012345678
 trusted_role_ids = []
 allowlisted_user_ids = []

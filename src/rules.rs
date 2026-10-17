@@ -291,4 +291,27 @@ mod tests {
         t.gc(now() + Duration::minutes(30));
         assert!(t.snapshot(1, 2, now()).is_empty());
     }
+
+    // Regression S3: "evil.com." (trailing-dot FQDN) is the same host as "evil.com"
+    // and must match blocked_domains. extract_domains currently keeps the trailing
+    // dot, so neither the exact match nor the ".{blocked}" suffix match fires.
+    #[test]
+    #[ignore = "S3: trailing-dot domains do not match blocked_domains"]
+    fn s3_trailing_dot_domain_matches_blocked() {
+        let g = GuildConfig { blocked_domains: vec!["evil.com".into()], ..Default::default() };
+        let rc = RuleConfig::default();
+        assert!(!extract_domains("visit https://evil.com./now").is_empty(), "domain should still be extracted");
+        assert!(text_signals("visit https://evil.com./now", false, &rc, &g).has("blocked_domain"));
+    }
+
+    // Regression S8: the invite allowlist must be case-sensitive — allowlisting the
+    // code "AbC123" must not allowlist "abc123". Both sides are currently lowercased
+    // (normalize() lowercases the code, text_signals() lowercases the allowlist).
+    #[test]
+    #[ignore = "S8: invite allowlist comparison lowercases both sides, matching case-insensitively"]
+    fn s8_invite_allowlist_is_case_sensitive() {
+        let g = GuildConfig { allowed_invites: vec!["AbC123".into()], ..Default::default() };
+        let f = facts("join discord.gg/abc123");
+        assert!(evaluate(&f, &[], &RuleConfig::default(), &g).has("invite_link"));
+    }
 }

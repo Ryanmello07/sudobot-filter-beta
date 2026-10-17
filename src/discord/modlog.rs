@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::ports::{IncidentReport, ModLog};
+use crate::store::Store;
 use async_trait::async_trait;
 use serenity::all::*;
 use std::sync::Arc;
@@ -7,6 +8,14 @@ use std::sync::Arc;
 pub struct DiscordModLog {
     pub http: Arc<Http>,
     pub cfg: Arc<Config>,
+    pub store: Store,
+}
+
+impl DiscordModLog {
+    /// Mod-log destination: per-guild DB override first, then the config default.
+    async fn effective_log_channel(&self, guild: u64) -> Option<u64> {
+        self.store.log_channel(guild).await.or(self.cfg.guild(guild).log_channel_id)
+    }
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -25,7 +34,7 @@ fn code(s: &str, n: usize) -> String {
 #[async_trait]
 impl ModLog for DiscordModLog {
     async fn incident(&self, r: &IncidentReport) {
-        let Some(ch) = self.cfg.guild(r.guild_id).log_channel_id else {
+        let Some(ch) = self.effective_log_channel(r.guild_id).await else {
             tracing::info!("incident {} ({} {} {:.2}) -> {}", r.incident_id, r.tier, r.label, r.score, r.taken);
             return;
         };
@@ -72,7 +81,7 @@ impl ModLog for DiscordModLog {
     }
 
     async fn notice(&self, guild: u64, text: &str) {
-        let Some(ch) = self.cfg.guild(guild).log_channel_id else {
+        let Some(ch) = self.effective_log_channel(guild).await else {
             tracing::info!("notice: {text}");
             return;
         };

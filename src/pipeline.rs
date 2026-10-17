@@ -2,7 +2,7 @@
 
 use crate::budget::{BreakerEvent, Budget, Denied, Priority};
 use crate::cache::TtlCache;
-use crate::config::{Config, ContextFeed};
+use crate::config::{Config, ContextFeed, GuildConfig};
 use crate::fusion::{fuse, Inputs};
 use crate::guarded::{guarded, GuardErr, Guarded};
 use crate::imaging;
@@ -99,6 +99,8 @@ pub struct Pipeline {
     activity: Activity,
     jev_cache: TtlCache<String, JevResult>,
     ocr_cache: TtlCache<String, String>,
+    /// Per-guild effective config (static + DB override); short TTL, invalidated on write.
+    cfg_cache: TtlCache<u64, Arc<GuildConfig>>,
     announced: Mutex<HashSet<(&'static str, &'static str, NaiveDate)>>,
     feed_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -117,6 +119,7 @@ impl Pipeline {
             activity: Activity::default(),
             jev_cache: TtlCache::new(jev_ttl, 4096),
             ocr_cache: TtlCache::new(ocr_ttl, 4096),
+            cfg_cache: TtlCache::new(std::time::Duration::from_secs(30), 256),
             announced: Mutex::new(HashSet::new()),
             feed_tasks: Mutex::new(vec![]),
         }
@@ -124,6 +127,41 @@ impl Pipeline {
 
     pub fn store(&self) -> &Store {
         &self.d.store
+    }
+
+    /// Mod-log destination for a guild: the DB override (set via `/guard logchannel`)
+    /// wins over the config.toml default.
+    pub async fn effective_log_channel(&self, guild: u64) -> Option<u64> {
+        self.d.store.log_channel(guild).await.or(self.d.cfg.guild(guild).log_channel_id)
+    }
+
+    /// The effective config for a guild: static config.toml ([defaults] + [guild.<id>])
+    /// deep-merged with the guild's DB override doc. Cached for 30s; invalidated by
+    /// `invalidate_guild_config` on every `/guard config` write. A corrupt stored doc
+    /// falls back to the static config (fail-open to the known-good state).
+    pub async fn effective_guild_config(&self, guild: u64) -> Arc<GuildConfig> {
+        if let Some(c) = self.cfg_cache.get(&guild) {
+            return c;
+        }
+        let g = match self.d.store.guild_override(guild).await {
+            Some(doc) if !doc.trim().is_empty() => self.d.cfg.apply_override(guild, &doc).unwrap_or_else(|e| {
+                tracing::warn!("stored config override for guild {guild} is invalid ({e}); using static config");
+                self.d.cfg.guild(guild).clone()
+            }),
+            _ => self.d.cfg.guild(guild).clone(),
+        };
+        let g = Arc::new(g);
+        self.cfg_cache.put(guild, g.clone());
+        g
+    }
+
+    pub fn invalidate_guild_config(&self, guild: u64) {
+        self.cfg_cache.invalidate(&guild);
+    }
+
+    /// Validate a candidate override doc for a guild without saving it.
+    pub fn check_guild_override(&self, guild: u64, doc: &str) -> anyhow::Result<GuildConfig> {
+        self.d.cfg.apply_override(guild, doc)
     }
 
     /// (provider name, daily cap) for status output.
@@ -149,7 +187,7 @@ impl Pipeline {
 
     pub async fn handle(&self, m: IncomingMessage, now: DateTime<Utc>) -> Outcome {
         let g = m.guild_id;
-        let gc = self.d.cfg.guild(g);
+        let gc = self.effective_guild_config(g).await;
         let mut profile = m.profile.clone();
         if gc.allowlisted_user_ids.contains(&m.author_id) || self.d.store.is_allowlisted(g, m.author_id).await {
             profile.is_trusted = true;
@@ -187,7 +225,7 @@ impl Pipeline {
             can_mention_everyone: m.can_mention_everyone,
             is_first_message: is_first,
         };
-        let mut local = evaluate(&facts, &recent, &gc.rules, gc);
+        let mut local = evaluate(&facts, &recent, &gc.rules, &gc);
         if !m.is_edit {
             self.tracker.push(g, m.author_id, RecentMsg { at: now, channel_id: m.channel_id, hash: hash_text(&normalize(&m.content)), excerpt: trunc(&m.content, 500) });
         }
@@ -211,7 +249,7 @@ impl Pipeline {
         }
         if !ocr_text.is_empty() {
             let young = matches!(tier, Tier::Quarantine | Tier::Fresh);
-            local.merge(image_text_signals(&ocr_text, m.content.trim().is_empty(), young, &gc.rules, gc));
+            local.merge(image_text_signals(&ocr_text, m.content.trim().is_empty(), young, &gc.rules, &gc));
         }
 
         // ---- providers ----
@@ -530,7 +568,8 @@ impl Pipeline {
 
     async fn execute(&self, m: &IncomingMessage, tier: Tier, action: Action, now: DateTime<Utc>, failures: &mut Vec<String>) -> (String, usize, Option<&'static str>) {
         let g = m.guild_id;
-        let l = &self.d.cfg.guild(g).ladder;
+        let gc = self.effective_guild_config(g).await;
+        let l = &gc.ladder;
         let s = &self.d.sink;
         if let Err(why) = s.can_act(g, m.author_id).await {
             failures.push(format!("refused: {why}"));
@@ -580,7 +619,8 @@ impl Pipeline {
     }
 
     async fn sweep(&self, m: &IncomingMessage, now: DateTime<Utc>, failures: &mut Vec<String>) -> usize {
-        let l = &self.d.cfg.guild(m.guild_id).ladder;
+        let gc = self.effective_guild_config(m.guild_id).await;
+        let l = &gc.ladder;
         let rows = match self.d.store.recent_since(m.guild_id, m.author_id, now - Duration::minutes(l.sweep_minutes)).await {
             Ok(r) => r,
             Err(e) => {
@@ -623,7 +663,7 @@ impl Pipeline {
     /// Join-time screening. Only flags the member (raising their tier) and posts an
     /// alert. It never kicks or bans: names alone are weak evidence.
     pub async fn handle_join(&self, j: JoinEvent, now: DateTime<Utc>) -> bool {
-        let gc = self.d.cfg.guild(j.guild_id);
+        let gc = self.effective_guild_config(j.guild_id).await;
         let mut reasons: Vec<String> = vec![];
         let names = format!("{} {}", j.username, j.display_name);
 
@@ -689,10 +729,13 @@ mod tests {
 
     // ---------- fakes ----------
 
+    /// (message, user_id, context_id) recorded for each Paxmod call.
+    type PaxCall = (String, Option<u64>, Option<u64>);
+
     #[derive(Default)]
     struct FakePax {
         result: Mutex<Option<Result<PaxmodResult, ProviderError>>>,
-        calls: Mutex<Vec<(String, Option<u64>, Option<u64>)>>,
+        calls: Mutex<Vec<PaxCall>>,
     }
     impl FakePax {
         fn spam(score: f64) -> Arc<Self> {
@@ -842,6 +885,10 @@ mod tests {
     }
 
     async fn harness(pax: Arc<FakePax>, jev: Arc<FakeJev>, enforce: bool, roll: f64, sink: FakeSink) -> H {
+        harness_with_cfg(Config::default(), pax, jev, enforce, roll, sink).await
+    }
+
+    async fn harness_with_cfg(cfg: Config, pax: Arc<FakePax>, jev: Arc<FakeJev>, enforce: bool, roll: f64, sink: FakeSink) -> H {
         let store = Store::memory().await.unwrap();
         if enforce {
             store.set_mode(1, Mode::Enforce, 0).await.unwrap();
@@ -850,7 +897,7 @@ mod tests {
         let sink = Arc::new(sink);
         let log = Arc::new(FakeLog::default());
         let p = Pipeline::new(Deps {
-            cfg: Arc::new(Config::default()),
+            cfg: Arc::new(cfg),
             store,
             paxmod: pax.clone(),
             jev: jev.clone(),
@@ -1144,5 +1191,67 @@ mod tests {
             .await;
         assert!(!ok);
         assert!(h.pax.calls.lock().unwrap().iter().all(|c| c.2.is_none()));
+    }
+
+    #[tokio::test]
+    async fn effective_log_channel_db_override_beats_config_default() {
+        let cfg = Config::from_toml_str("[defaults]\nlog_channel_id = 9\n").unwrap();
+        let h = harness_with_cfg(cfg, FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        assert_eq!(h.p.effective_log_channel(1).await, Some(9), "config default applies when no DB override");
+        h.p.store().set_log_channel(1, 42, 7).await.unwrap();
+        assert_eq!(h.p.effective_log_channel(1).await, Some(42), "DB override wins over config");
+        assert_eq!(h.p.effective_log_channel(2).await, Some(9), "other guilds keep the config default");
+    }
+
+    #[tokio::test]
+    async fn guild_override_doc_changes_effective_config() {
+        let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        assert!(h.p.effective_guild_config(1).await.blocked_domains.is_empty());
+        let doc = crate::config::override_set(None, "blocked_domains", "evil.com, scam.xyz").unwrap();
+        h.p.store().set_guild_override(1, &doc, 7).await.unwrap();
+        h.p.invalidate_guild_config(1);
+        let gc = h.p.effective_guild_config(1).await;
+        assert_eq!(gc.blocked_domains, vec!["evil.com".to_string(), "scam.xyz".to_string()]);
+        assert!(h.p.effective_guild_config(2).await.blocked_domains.is_empty(), "other guilds unaffected");
+        // a corrupt stored doc fails open to the static config
+        h.p.store().set_guild_override(1, "ladder = 42", 7).await.unwrap();
+        h.p.invalidate_guild_config(1);
+        assert!(h.p.effective_guild_config(1).await.blocked_domains.is_empty());
+    }
+
+    // ---------- regression tests for audit findings (all #[ignore]d) ----------
+    // Regression M5: reprocessing an already-actioned message must not clobber the
+    // stored action_taken ("delete+timeout") with "already". insert_incident's
+    // ON CONFLICT upsert currently overwrites it, erasing the record of what was
+    // actually done. (FakeSink never really deletes, so the second pass reaches the
+    // record step — mirroring a redelivered gateway event.)
+    #[tokio::test]
+    #[ignore = "M5: incident upsert overwrites action_taken with \"already\" on reprocessing"]
+    async fn m5_reprocessing_does_not_overwrite_action_taken() {
+        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let m = msg(5, 7, "buy cheap stuff now", new_user(7));
+        let first = h.p.handle(m.clone(), Utc::now()).await;
+        assert_eq!(first.taken, "delete+timeout");
+        let id = first.incident_id.unwrap();
+        let second = h.p.handle(m, Utc::now()).await;
+        assert_eq!(second.taken, "already", "second pass should recognize the incident");
+        assert_eq!(h.sink.count("delete 50 5"), 1);
+        let row = h.p.store().incident(id).await.unwrap().unwrap();
+        assert_eq!(row.action_taken, "delete+timeout", "stored action_taken must survive reprocessing");
+    }
+
+    // Regression S2: the Jev cache key is hash(normalize(text)) only, so identical
+    // text from authors with different tiers/account ages shares one cached verdict
+    // even though the JevState sent to the API carries account_age_days and
+    // minutes_in_guild. Desired: the cache key also covers author context, so two
+    // different authors cost two calls. NOTE: jev_cache is private, so this asserts
+    // the observable consequence (Jev call count) rather than the key itself.
+    #[tokio::test]
+    #[ignore = "S2: Jev cache key ignores author context (tier, account age)"]
+    async fn s2_jev_cache_key_includes_author_context() {
+        let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        h.p.handle(msg(1, 7, "check this out", profile(7, 2, 3)), Utc::now()).await; // 2h-old account
+        h.p.handle(msg(2, 8, "check this out", profile(8, 20, 3)), Utc::now()).await; // 20h-old account
+        assert_eq!(h.jev.n(), 2, "identical text from different author contexts must not share a Jev cache entry");
     }
 }

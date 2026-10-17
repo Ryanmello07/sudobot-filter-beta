@@ -107,8 +107,7 @@ mod tests {
 
     #[test]
     fn disabled_rungs_fall_back() {
-        let mut l = LadderConfig::default();
-        l.enable_ban = false;
+        let mut l = LadderConfig { enable_ban: false, ..Default::default() };
         let v = verdict(0.99, Label::Spam, 2);
         assert_eq!(decide(Tier::Quarantine, &v, &Default::default(), &l), Action::Kick);
         l.enable_kick = false;
