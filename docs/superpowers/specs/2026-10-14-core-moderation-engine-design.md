@@ -275,7 +275,17 @@ Evaluation order: Trusted, Quarantine, Fresh, Established. Note the OR: an old a
 that just joined is Quarantine, and a brand-new account that has been in the guild
 for a day is Fresh until it passes both thresholds.
 
-**Modifiers** (applied after the base tier, never to Trusted):
+> **Revision 2026-10-17 (sleeper-alt hardening):** Established must be *earned by
+> history*, not time. After the time-based base tier, a member who would be
+> Established but has fewer than `graduation_clean_messages` clean scanned messages
+> is downgraded to Fresh (and thus stays fully scanned, Plan::ALL). This neutralizes
+> parked cold alts aging past the time gates, and also covers missing `joined_at`
+> (which falls back to account age): without history the member is Fresh. The
+> downgrade applies before the escalation modifiers below, so a flagged sleeper
+> drops Fresh → Quarantine. History DB errors yield zero clean scans, which
+> downgrades — the fail-safe direction.
+
+**Modifiers** (applied after the base tier and the downgrade rule, never to Trusted):
 
 - Escalate up one tier (max Quarantine) if the member has an active strike, a prior
   flagged message in the last 30 days, a first message containing a link or mention,

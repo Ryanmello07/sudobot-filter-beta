@@ -32,6 +32,19 @@ pub fn base_tier(p: &MemberProfile, cfg: &TierConfig, now: DateTime<Utc>) -> Tie
     }
 }
 
+/// Order of operations: time-based `base_tier` → Trusted early return →
+/// **downgrade rule** (Established must be earned by history) → escalation
+/// (one step toward Quarantine from strikes / recent flags / join flag / risky
+/// first message).
+///
+/// Downgrade rule: an otherwise-Established member with fewer than
+/// `cfg.graduation_clean_messages` clean scanned messages stays Fresh (and thus
+/// ungraduated, fully scanned). Scammers park "sleeper" alts in servers to age
+/// past the time gates; time alone must never grant the cheap sampled tier. This
+/// also covers missing `joined_at` (which falls back to account age): without
+/// history the member is Fresh, not Established. Fail-safe: history DB errors
+/// yield `MemberHistory::default()` (clean_scans = 0), which downgrades — the
+/// safe direction.
 pub fn compute_tier(
     p: &MemberProfile,
     h: &MemberHistory,
@@ -43,6 +56,7 @@ pub fn compute_tier(
     if base == Tier::Trusted {
         return base;
     }
+    let base = if base == Tier::Established && h.clean_scans < cfg.graduation_clean_messages { Tier::Fresh } else { base };
     let escalate = h.active_strikes > 0
         || h.flagged_recently
         || h.join_flag
@@ -55,7 +69,9 @@ pub fn compute_tier(
 }
 
 /// Fresh members with enough clean scanned messages move from "scan every
-/// message" to sampling. Does not change the tier label.
+/// message" to sampling. Does not change the tier label. Note the same
+/// threshold (`graduation_clean_messages`) also gates reaching the Established
+/// tier at all — see `compute_tier`.
 pub fn graduated(tier: Tier, h: &MemberHistory, cfg: &TierConfig) -> bool {
     tier == Tier::Fresh && h.clean_scans >= cfg.graduation_clean_messages
 }
@@ -142,12 +158,13 @@ mod tests {
         // exactly 30 minutes in guild is no longer quarantine
         let p = profile(Duration::days(1000), Duration::minutes(30));
         assert_eq!(tier(&p, &Default::default(), Default::default()), Tier::Fresh);
-        // exactly 7 days in guild, old account -> established
+        // exactly 7 days in guild, old account + earned history -> established
         let p = profile(Duration::days(1000), Duration::days(7));
-        assert_eq!(tier(&p, &Default::default(), Default::default()), Tier::Established);
-        // account exactly 30 days, in guild a long time -> established
+        let h = MemberHistory { clean_scans: 10, ..Default::default() };
+        assert_eq!(tier(&p, &h, Default::default()), Tier::Established);
+        // account exactly 30 days, in guild a long time + earned history -> established
         let p = profile(Duration::days(30), Duration::days(100));
-        assert_eq!(tier(&p, &Default::default(), Default::default()), Tier::Established);
+        assert_eq!(tier(&p, &h, Default::default()), Tier::Established);
     }
 
     #[test]
@@ -161,23 +178,48 @@ mod tests {
     #[test]
     fn modifiers_escalate_one_step() {
         let p = profile(Duration::days(1000), Duration::days(100));
-        assert_eq!(tier(&p, &Default::default(), Default::default()), Tier::Established);
-        let h = MemberHistory { active_strikes: 1, ..Default::default() };
+        // with enough clean history the member is Established; modifiers drop one step
+        let clean = MemberHistory { clean_scans: 10, ..Default::default() };
+        assert_eq!(tier(&p, &clean, Default::default()), Tier::Established);
+        let h = MemberHistory { active_strikes: 1, clean_scans: 10, ..Default::default() };
         assert_eq!(tier(&p, &h, Default::default()), Tier::Fresh);
-        let h = MemberHistory { flagged_recently: true, ..Default::default() };
+        let h = MemberHistory { flagged_recently: true, clean_scans: 10, ..Default::default() };
         assert_eq!(tier(&p, &h, Default::default()), Tier::Fresh);
         let hints = TierHints { risky_first_message: true };
-        assert_eq!(tier(&p, &Default::default(), hints), Tier::Fresh);
+        assert_eq!(tier(&p, &clean, hints), Tier::Fresh);
         // multiple modifiers still only one step
-        let h = MemberHistory { active_strikes: 1, join_flag: true, ..Default::default() };
+        let h = MemberHistory { active_strikes: 1, join_flag: true, clean_scans: 10, ..Default::default() };
         assert_eq!(tier(&p, &h, hints), Tier::Fresh);
+    }
+
+    #[test]
+    fn established_must_be_earned_by_history() {
+        // (a) aged account, years in the guild, zero clean scans: a sleeper alt stays Fresh
+        let p = profile(Duration::days(2000), Duration::days(365));
+        assert_eq!(tier(&p, &Default::default(), Default::default()), Tier::Fresh);
+        // (b) same member once they reach the graduation threshold: Established
+        let h = MemberHistory { clean_scans: 10, ..Default::default() };
+        assert_eq!(tier(&p, &h, Default::default()), Tier::Established);
+        // (e) one short of the threshold: still Fresh
+        let h = MemberHistory { clean_scans: 9, ..Default::default() };
+        assert_eq!(tier(&p, &h, Default::default()), Tier::Fresh);
+        // (c) sleeper alt with an active strike: downgrade to Fresh, then escalate to Quarantine
+        let h = MemberHistory { active_strikes: 1, ..Default::default() };
+        assert_eq!(tier(&p, &h, Default::default()), Tier::Quarantine);
+        // (d) Trusted is unaffected by the downgrade rule
+        let mut t = profile(Duration::days(2000), Duration::days(365));
+        t.is_trusted = true;
+        assert_eq!(tier(&t, &Default::default(), Default::default()), Tier::Trusted);
     }
 
     #[test]
     fn missing_joined_at_falls_back_to_account_age() {
         let mut p = profile(Duration::days(1000), Duration::minutes(1));
         p.joined_at = None;
-        assert_eq!(tier(&p, &Default::default(), Default::default()), Tier::Established);
+        // without earned history the account age alone lands at Fresh, not Established
+        assert_eq!(tier(&p, &Default::default(), Default::default()), Tier::Fresh);
+        let h = MemberHistory { clean_scans: 10, ..Default::default() };
+        assert_eq!(tier(&p, &h, Default::default()), Tier::Established);
     }
 
     #[test]

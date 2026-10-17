@@ -283,6 +283,14 @@ impl Pipeline {
             flag_threshold(tier, &gc.ladder),
         );
         let planned = decide(tier, &verdict, &history, &gc.ladder);
+        tracing::info!(
+            "decision: guild={g} msg={} user={} tier={} local={:.3} providers={} ocr={} fused={:.3} label={} planned={} signals={:?} everyone={} first={} text={:?}",
+            m.message_id, m.author_id, tier.name(), local.score, plan.providers, plan.ocr,
+            verdict.score, verdict.label.name(), planned.name(),
+            local.signals.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            facts.mentions_everyone_text, facts.is_first_message,
+            trunc(&m.content, 120)
+        );
 
         // ---- execute ----
         let mut taken = "none".to_string();
@@ -968,6 +976,14 @@ mod tests {
         profile(u, 24 * 1000, 60 * 24 * 100) // established
     }
 
+    /// Seed enough clean scans for `u` to earn the Established tier (sleeper-alt
+    /// rule: Established requires history, not just time).
+    async fn seed_clean(h: &H, u: u64) {
+        for _ in 0..10 {
+            h.p.store().note_clean_scan(1, u).await.unwrap();
+        }
+    }
+
     // ---------- tests ----------
 
     #[tokio::test]
@@ -1043,6 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn established_clean_message_skips_paid_providers() {
         let h = harness(FakePax::spam(1.0), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
+        seed_clean(&h, 8).await; // Established must be earned by history
         let o = h.p.handle(msg(1, 8, "hello everyone, nice weather", old_user(8)), Utc::now()).await;
         assert_eq!(o.tier, Tier::Established);
         assert_eq!(o.plan, Plan::NONE);
@@ -1053,6 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn established_local_hit_triggers_providers() {
         let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        seed_clean(&h, 8).await;
         let mut m = msg(1, 8, "hi", old_user(8));
         m.distinct_mentions = 12; // mass mention, 0.7
         let o = h.p.handle(m, Utc::now()).await;
@@ -1144,6 +1162,7 @@ mod tests {
     #[tokio::test]
     async fn established_plain_image_is_not_ocrd() {
         let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        seed_clean(&h, 8).await;
         let mut m = msg(1, 8, "here is the picture from our trip yesterday", old_user(8));
         m.image_urls = vec!["https://cdn.discordapp.com/a.png".into()];
         h.p.handle(m, Utc::now()).await;
@@ -1158,6 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn context_feed_sends_active_channel_messages_to_paxmod() {
         let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        seed_clean(&h, 8).await; // earn Established so the member is fed, not scanned
         let now = Utc::now();
         // a new member speaks in channel 50, opening the feed window
         h.p.handle(msg(1, 7, "hello", new_user(7)), now).await;
@@ -1215,6 +1235,7 @@ mod tests {
     #[tokio::test]
     async fn context_feed_and_join_screening_record_usage() {
         let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        seed_clean(&h, 8).await; // earn Established so the member is fed, not scanned
         let now = Utc::now();
         // quarantine member speaks: scanned (paxmod 1, jev 1), opens the feed window
         h.p.handle(msg(1, 7, "hello", new_user(7)), now).await;

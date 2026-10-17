@@ -43,6 +43,9 @@ quarantine_minutes_in_guild = 30
 quarantine_account_hours = 24
 fresh_days_in_guild = 7
 fresh_account_days = 30
+# Clean scanned messages a Fresh member needs before sampling instead of full scans.
+# Also gates the Established tier itself: time alone never grants Established, so
+# "sleeper" alts parked in the server stay Fresh and are fully scanned.
 graduation_clean_messages = 10
 
 [defaults.plan]
