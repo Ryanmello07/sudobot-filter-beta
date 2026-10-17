@@ -563,9 +563,13 @@ impl Pipeline {
             return;
         }
         let (pax, budget) = (self.d.paxmod.clone(), self.d.budgets.paxmod.clone());
+        let store = self.d.store.clone();
         let (text, user, ch) = (trunc(&m.content, 5000), m.author_id, m.channel_id);
         let h = tokio::spawn(async move {
             let g = guarded(&budget, Priority::Low, now, || pax.moderate(&text, Some(user), Some(ch))).await;
+            if g.called {
+                let _ = store.record_usage("paxmod", 1, g.result.is_err() as i64, now).await;
+            }
             if let Err(GuardErr::Provider(e)) = g.result {
                 tracing::debug!("context feed send failed: {e}");
             }
@@ -694,6 +698,9 @@ impl Pipeline {
         // Providers on the name fields. No context_id: names must not pollute conversations.
         let now_p = now;
         let g = guarded(&self.d.budgets.paxmod, Priority::Low, now_p, || self.d.paxmod.moderate(names.trim(), Some(j.user_id), None)).await;
+        if g.called {
+            let _ = self.d.store.record_usage("paxmod", 1, g.result.is_err() as i64, now).await;
+        }
         if let Ok(r) = g.result {
             let (spam, abuse) = crate::fusion::paxmod_risks(&r);
             if spam >= 0.7 || abuse >= 0.8 {
@@ -709,6 +716,9 @@ impl Pipeline {
             ..Default::default()
         };
         let g = guarded(&self.d.budgets.jev, Priority::Low, now_p, || self.d.jev.assess(&state)).await;
+        if g.called {
+            let _ = self.d.store.record_usage("jev", 1, g.result.is_err() as i64, now).await;
+        }
         if let Ok(r) = g.result {
             let (spam, _) = crate::fusion::jev_risks(&r);
             if spam >= 0.8 {
@@ -1203,8 +1213,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effective_log_channel_db_override_beats_config_default() {
-        let cfg = Config::from_toml_str("[defaults]\nlog_channel_id = 9\n").unwrap();
+    async fn context_feed_and_join_screening_record_usage() {
+        let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        let now = Utc::now();
+        // quarantine member speaks: scanned (paxmod 1, jev 1), opens the feed window
+        h.p.handle(msg(1, 7, "hello", new_user(7)), now).await;
+        // established member in the same channel: context-fed to Paxmod only
+        h.p.handle(msg(2, 8, "hi there friend", old_user(8)), now).await;
+        h.p.drain_feed().await;
+        // join screening calls both providers at Low priority
+        h.p.handle_join(JoinEvent { guild_id: 1, user_id: 9, username: "alice".into(), display_name: "a".into(), profile: old_user(9) }, now).await;
+        assert_eq!(h.p.store().usage_today("paxmod", now).await.0, 3, "scan + feed + join screening");
+        assert_eq!(h.p.store().usage_today("jev", now).await.0, 2, "scan + join screening");
+    }
+
+    #[tokio::test]
+    async fn effective_log_channel_db_override_beats_config_default() {        let cfg = Config::from_toml_str("[defaults]\nlog_channel_id = 9\n").unwrap();
         let h = harness_with_cfg(cfg, FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
         assert_eq!(h.p.effective_log_channel(1).await, Some(9), "config default applies when no DB override");
         h.p.store().set_log_channel(1, 42, 7).await.unwrap();
