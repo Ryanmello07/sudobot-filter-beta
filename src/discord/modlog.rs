@@ -38,7 +38,16 @@ fn humanize_in_server(minutes: Option<i64>) -> String {
         None => "unknown".into(),
         Some(m) if m < 60 => format!("{m}m"),
         Some(m) if m < 48 * 60 => format!("{}h", m / 60),
-        Some(m) => format!("{}d", m / (24 * 60)),
+        Some(m) => humanize_days(m / (24 * 60)),
+    }
+}
+
+/// 1604d is how robots talk; humans say 4.4y. Days are fine under a year.
+fn humanize_days(days: i64) -> String {
+    if days < 365 {
+        format!("{days}d")
+    } else {
+        format!("{:.1}y", days as f64 / 365.25)
     }
 }
 
@@ -84,7 +93,7 @@ fn incident_embed(r: &IncidentReport) -> CreateEmbed {
         .title(embed_title(r))
         .color(embed_color(r))
         .field("Member", format!("<@{}> (`{}`)", r.user_id, r.user_id), true)
-        .field("Account", format!("{}d old, {} in server", r.account_age_days, humanize_in_server(r.minutes_in_guild)), true)
+        .field("Account", format!("{} old, {} in server", humanize_days(r.account_age_days), humanize_in_server(r.minutes_in_guild)), true)
         .field("Channel", format!("<#{}>", r.channel_id), true)
         .field(
             "Score",
@@ -111,7 +120,6 @@ fn incident_embed(r: &IncidentReport) -> CreateEmbed {
 fn incident_buttons(r: &IncidentReport) -> Vec<CreateButton> {
     let id = r.incident_id;
     vec![
-        CreateButton::new(format!("undo:{id}")).label("Undo").style(ButtonStyle::Secondary),
         CreateButton::new(format!("safe:{id}")).label("Mark safe").style(ButtonStyle::Success),
         CreateButton::new(format!("timeout:{id}")).label("Timeout").style(ButtonStyle::Secondary),
         CreateButton::new(format!("kick:{id}")).label("Kick").style(ButtonStyle::Primary),
@@ -161,6 +169,12 @@ mod tests {
         assert_eq!(humanize_in_server(Some(47 * 60 + 59)), "47h");
         assert_eq!(humanize_in_server(Some(48 * 60)), "2d");
         assert_eq!(humanize_in_server(Some(82553)), "57d");
+        assert_eq!(humanize_days(0), "0d");
+        assert_eq!(humanize_days(89), "89d");
+        assert_eq!(humanize_days(364), "364d");
+        assert_eq!(humanize_days(365), "1.0y");
+        assert_eq!(humanize_days(1604), "4.4y");
+        assert_eq!(humanize_in_server(Some(82553)), "57d");
     }
 
     fn report(taken: &str, observe: bool) -> IncidentReport {
@@ -199,7 +213,7 @@ mod tests {
         let fields = v["fields"].as_array().unwrap();
         let get = |name: &str| fields.iter().find(|f| f["name"] == name).map(|f| f["value"].as_str().unwrap().to_string());
         assert_eq!(get("Member").as_deref(), Some("<@7> (`7`)"));
-        assert_eq!(get("Account").as_deref(), Some("1604d old, 57d in server"));
+        assert_eq!(get("Account").as_deref(), Some("4.4y old, 57d in server"));
         assert!(get("Score").unwrap().contains("0.86 fused · spam 0.86 · abuse 0.00 · 2 source(s)"));
         assert!(get("Message").unwrap().contains("free nitro at evil.com"));
         assert!(get("Message").unwrap().starts_with("```"));
@@ -227,7 +241,7 @@ mod tests {
         let v = serde_json::to_value(incident_embed(&r)).unwrap();
         let fields = v["fields"].as_array().unwrap();
         let account = fields.iter().find(|f| f["name"] == "Account").unwrap()["value"].as_str().unwrap().to_string();
-        assert_eq!(account, "1604d old, unknown in server");
+        assert_eq!(account, "4.4y old, unknown in server");
         let msg = fields.iter().find(|f| f["name"] == "Message").unwrap()["value"].as_str().unwrap().to_string();
         assert!(msg.contains("'''"), "inner fence escaped");
         assert!(!msg.contains("fence ```"), "inner fence must not survive inside the code block");

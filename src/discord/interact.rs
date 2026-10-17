@@ -26,6 +26,17 @@ pub async fn register(ctx: &Context, guild: GuildId) {
             ),
         )
         .add_option(
+            CreateCommandOption::new(CommandOptionType::SubCommand, "safe", "Allowlist a member: stop scanning them and clear their strikes")
+                .add_sub_option(CreateCommandOption::new(CommandOptionType::User, "user", "member to mark safe").required(true))
+                .add_sub_option(CreateCommandOption::new(CommandOptionType::String, "note", "optional note for the mod log").required(false))
+                .add_sub_option(guild_opt()),
+        )
+        .add_option(
+            CreateCommandOption::new(CommandOptionType::SubCommand, "unsafe", "Remove a member from the allowlist (resume normal scanning)")
+                .add_sub_option(CreateCommandOption::new(CommandOptionType::User, "user", "member to remove").required(true))
+                .add_sub_option(guild_opt()),
+        )
+        .add_option(
             CreateCommandOption::new(CommandOptionType::SubCommandGroup, "config", "View or edit server config (stored in the DB, overrides config.toml)")
                 .add_sub_option(
                     CreateCommandOption::new(CommandOptionType::SubCommand, "show", "Show the effective config").add_sub_option(guild_opt()),
@@ -124,6 +135,8 @@ pub async fn command(ctx: &Context, c: &CommandInteraction, p: &Pipeline, shed: 
             }
         }
         "config" => config_cmd(ctx, c, p, sub, gid.get(), manager_guild).await,
+        "safe" => safe_cmd(ctx, c, p, sub, gid.get(), manager_guild, true).await,
+        "unsafe" => safe_cmd(ctx, c, p, sub, gid.get(), manager_guild, false).await,
         "guilds" => {
             if manager_guild != Some(gid.get()) {
                 return reply_cmd(ctx, c, "Only bot managers can use this, and only inside the manager server.".into()).await;
@@ -162,6 +175,68 @@ pub async fn command(ctx: &Context, c: &CommandInteraction, p: &Pipeline, shed: 
             }
         }
         _ => {}
+    }
+}
+
+/// Refuse nonsensical allowlist targets: the guild owner (unactionable anyway) and
+/// the bot itself (never scanned). `owner` is None when the guild isn't cached.
+fn allowlist_target_ok(target: u64, owner: Option<u64>, bot: u64) -> Result<(), String> {
+    if Some(target) == owner {
+        return Err("That's the server owner — they're effectively trusted already.".into());
+    }
+    if target == bot {
+        return Err("That's me — I don't get scanned.".into());
+    }
+    Ok(())
+}
+
+/// `/guard safe` / `/guard unsafe`: per-guild member allowlist management.
+async fn safe_cmd(ctx: &Context, c: &CommandInteraction, p: &Pipeline, sub: &CommandDataOption, invoked: u64, manager_guild: Option<u64>, safe: bool) {
+    let opts = match &sub.value {
+        CommandDataOptionValue::SubCommand(o) => o.as_slice(),
+        _ => &[],
+    };
+    let user = opts.iter().find(|o| o.name == "user").and_then(|o| match o.value {
+        CommandDataOptionValue::User(u) => Some(u),
+        _ => None,
+    });
+    let Some(user) = user else { return reply_cmd(ctx, c, "Missing user.".into()).await };
+    let note = opts.iter().find(|o| o.name == "note").and_then(|o| o.value.as_str());
+    let guild_opt = opts.iter().find(|o| o.name == "guild").and_then(|o| o.value.as_str());
+    let target = match resolve_target(invoked, true, manager_guild, guild_opt) {
+        Ok(t) => t,
+        Err(e) => return reply_cmd(ctx, c, e).await,
+    };
+    let scope = if target == invoked { "this server".to_string() } else { format!("server `{target}`") };
+    let (uid, who) = (user.get(), c.user.id.get());
+
+    if safe {
+        // The owner check needs the guild in cache; cross-guild manager use may miss it.
+        // Copy plain values out of the cache guards before any await (they're !Send).
+        let owner = ctx.cache.guild(GuildId::new(target)).map(|g| g.owner_id.get());
+        let me = ctx.cache.current_user().id.get();
+        if let Err(e) = allowlist_target_ok(uid, owner, me) {
+            return reply_cmd(ctx, c, e).await;
+        }
+        if p.store().is_allowlisted(target, uid).await {
+            return reply_cmd(ctx, c, format!("<@{uid}> is already on the allowlist for {scope}.")).await;
+        }
+        if let Err(e) = p.store().set_allowlisted(target, uid, true).await {
+            return reply_cmd(ctx, c, format!("Could not save: {e}")).await;
+        }
+        let cleared = p.store().clear_strikes(target, uid, chrono::Utc::now()).await.unwrap_or(0);
+        let note_txt = note.map(|n| format!(" — {n}")).unwrap_or_default();
+        p.log_notice(target, &format!("🛡️ <@{uid}> marked safe by <@{who}> (allowlisted, {cleared} active strike(s) cleared){note_txt}")).await;
+        reply_cmd(ctx, c, format!("<@{uid}> is now on the allowlist for {scope}: no longer scanned, {cleared} active strike(s) cleared.{note_txt}")).await;
+    } else {
+        if !p.store().is_allowlisted(target, uid).await {
+            return reply_cmd(ctx, c, format!("<@{uid}> is not on the allowlist for {scope}.")).await;
+        }
+        if let Err(e) = p.store().set_allowlisted(target, uid, false).await {
+            return reply_cmd(ctx, c, format!("Could not save: {e}")).await;
+        }
+        p.log_notice(target, &format!("🔎 <@{uid}> removed from the allowlist by <@{who}>; normal scanning applies.")).await;
+        reply_cmd(ctx, c, format!("<@{uid}> is no longer on the allowlist for {scope}; normal scanning applies.")).await;
     }
 }
 
@@ -346,30 +421,6 @@ pub async fn component(ctx: &Context, c: &ComponentInteraction, p: &Pipeline) {
                 Err(e) => reply_comp(ctx, c, &format!("Could not {action}: {e}")).await,
             }
         }
-        "undo" => {
-            let who = c.user.id.get();
-            let res: Result<&str, String> = match inc.action_taken.as_str() {
-                "delete+timeout" if admin || perms.contains(Permissions::MODERATE_MEMBERS) => gid
-                    .edit_member(&ctx.http, uid, EditMember::new().enable_communication().audit_log_reason("chat guard undo"))
-                    .await
-                    .map(|_| "Timeout removed. Deleted messages cannot be restored.")
-                    .map_err(|e| e.to_string()),
-                "ban" if admin || perms.contains(Permissions::BAN_MEMBERS) => {
-                    gid.unban(&ctx.http, uid).await.map(|_| "Unbanned.").map_err(|e| e.to_string())
-                }
-                "delete+timeout" | "ban" => Err("You lack the permission needed to undo this.".into()),
-                "kick" => Ok("A kick cannot be undone; the member can rejoin."),
-                "delete" => Ok("Deleted messages cannot be restored."),
-                _ => Ok("Nothing to undo for this incident."),
-            };
-            match res {
-                Ok(text) => {
-                    let _ = p.store().set_outcome(id, &format!("undone by {who}")).await;
-                    reply_comp(ctx, c, text).await
-                }
-                Err(e) => reply_comp(ctx, c, &format!("Undo failed: {e}")).await,
-            }
-        }
         "safe" => {
             if !(admin || perms.contains(Permissions::MANAGE_GUILD)) {
                 return reply_comp(ctx, c, "You need the Manage Server permission.").await;
@@ -379,6 +430,8 @@ pub async fn component(ctx: &Context, c: &ComponentInteraction, p: &Pipeline) {
             let _ = p.store().set_outcome(id, &format!("marked safe by {}", c.user.id.get())).await;
             reply_comp(ctx, c, "Member added to the allowlist and the strike from this incident cleared.").await
         }
+        // "undo" was removed: the manual Ban/Kick/Timeout buttons plus Mark safe
+        // are the mod toolbox.
         _ => {}
     }
 }
@@ -423,6 +476,14 @@ mod tests {
         assert!(e.contains("server owner"), "{e}");
         // unknown kind
         assert!(manual_action_gate("smite", true, Permissions::ADMINISTRATOR, "flag", "open", &ok).is_err());
+    }
+
+    #[test]
+    fn allowlist_target_guards() {
+        assert!(allowlist_target_ok(7, Some(1), 2).is_ok(), "ordinary member");
+        assert!(allowlist_target_ok(1, Some(1), 2).unwrap_err().contains("server owner"));
+        assert!(allowlist_target_ok(2, Some(1), 2).unwrap_err().contains("I don't get scanned"));
+        assert!(allowlist_target_ok(1, None, 2).is_ok(), "guild not cached: owner check skipped");
     }
 
     #[test]

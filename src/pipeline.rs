@@ -134,6 +134,11 @@ impl Pipeline {
         self.d.sink.can_act(guild, user).await
     }
 
+    /// Post a notice to the guild's mod log (audit trace for manual actions).
+    pub async fn log_notice(&self, guild: u64, text: &str) {
+        self.d.modlog.notice(guild, text).await;
+    }
+
     /// Mod-log destination for a guild: the DB override (set via `/guard logchannel`)
     /// wins over the config.toml default.
     pub async fn effective_log_channel(&self, guild: u64) -> Option<u64> {

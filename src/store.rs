@@ -333,6 +333,18 @@ impl Store {
         Ok(sqlx::query("DELETE FROM strikes WHERE incident_id = ?").bind(incident).execute(&self.pool).await?.rows_affected())
     }
 
+    /// Clear a member's ACTIVE strikes (expired rows are left for prune). Used by
+    /// `/guard safe`. Returns the number cleared.
+    pub async fn clear_strikes(&self, g: u64, u: u64, now: DateTime<Utc>) -> anyhow::Result<u64> {
+        Ok(sqlx::query("DELETE FROM strikes WHERE guild_id=? AND user_id=? AND expires_at > ?")
+            .bind(g as i64)
+            .bind(u as i64)
+            .bind(ts(now))
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
     // ---- recent messages (for sweeps) ----
 
     pub async fn add_recent(&self, g: u64, u: u64, ch: u64, msg: u64, at: DateTime<Utc>) -> anyhow::Result<()> {
@@ -575,6 +587,24 @@ mod tests {
         assert_eq!(s.history(1, 2, t + Duration::days(31)).await.unwrap().active_strikes, 0);
         assert_eq!(s.clear_strikes_for_incident(5).await.unwrap(), 1);
         assert_eq!(s.history(1, 2, t).await.unwrap().active_strikes, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_strikes_clears_only_active_for_that_member() {
+        let s = Store::memory().await.unwrap();
+        let t = now();
+        s.add_strike(1, 2, "timeout", 30, None, t).await.unwrap();
+        s.add_strike(1, 2, "kick", 30, None, t).await.unwrap();
+        s.add_strike(1, 2, "timeout", 1, None, t - Duration::days(2)).await.unwrap(); // expired
+        s.add_strike(2, 2, "timeout", 30, None, t).await.unwrap(); // other guild
+        s.add_strike(1, 3, "timeout", 30, None, t).await.unwrap(); // other member
+        assert_eq!(s.history(1, 2, t).await.unwrap().active_strikes, 2);
+        assert_eq!(s.clear_strikes(1, 2, t).await.unwrap(), 2, "two active strikes cleared");
+        assert_eq!(s.history(1, 2, t).await.unwrap().active_strikes, 0);
+        assert_eq!(s.history(2, 2, t).await.unwrap().active_strikes, 1, "other guild untouched");
+        assert_eq!(s.history(1, 3, t).await.unwrap().active_strikes, 1, "other member untouched");
+        // expired row remains until prune
+        assert_eq!(s.clear_strikes(1, 2, t).await.unwrap(), 0);
     }
 
     #[tokio::test]
