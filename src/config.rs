@@ -108,8 +108,10 @@ impl Default for PlanConfig {
 }
 
 /// Fused-score thresholds for one tier. `None` disables the rung for that tier.
+/// No container-level serde default: omitted rungs must stay `None` (disabled),
+/// not inherit `Rungs::default()`'s values.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct Rungs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flag: Option<f64>,
@@ -803,12 +805,10 @@ mod tests {
         assert!(s.contains("DB override: yes"));
     }
 
-    // Regression C1: a [defaults.ladder.established] table that omits kick/ban must
-    // leave those rungs DISABLED (None). The container-level `#[serde(default)]` on
-    // Rungs currently fills missing fields from Rungs::default() (Some(0.92) /
-    // Some(0.97)), silently enabling kick and ban for established members.
+    // Regression C1 (fixed): a [defaults.ladder.established] table that omits kick/ban
+    // leaves those rungs DISABLED (None); Rungs uses field-level defaults, not the
+    // container-level Rungs::default().
     #[test]
-    #[ignore = "C1: container-level serde default fills established.kick/ban with Some(0.92)/Some(0.97) instead of None"]
     fn c1_omitted_established_kick_ban_stay_disabled() {
         let c = Config::from_toml_str(
             "[defaults.ladder.established]\nflag = 0.65\ndelete = 0.85\ntimeout = 0.92\n",
@@ -818,10 +818,9 @@ mod tests {
         assert_eq!((e.kick, e.ban), (None, None));
     }
 
-    // Regression C1, against the shipped config.toml: it omits kick/ban under
+    // Regression C1 (fixed), against the shipped config.toml: it omits kick/ban under
     // [defaults.ladder.established], so both must deserialize to None.
     #[test]
-    #[ignore = "C1: shipped config.toml omits established kick/ban but deserialization enables them"]
     fn c1_shipped_config_keeps_established_kick_ban_disabled() {
         let s = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap();
         let c = Config::from_toml_str(&s).unwrap();
