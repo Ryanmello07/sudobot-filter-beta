@@ -266,6 +266,11 @@ pub async fn component(ctx: &Context, c: &ComponentInteraction, p: &Pipeline) {
     let Some(inc) = p.store().incident(id).await.ok().flatten() else {
         return reply_comp(ctx, c, "That incident is no longer stored.").await;
     };
+    // Buttons travel with the message; only act when the click happened in the
+    // guild the incident belongs to.
+    if !guild_matches(c.guild_id.map(|g| g.get()), inc.guild_id) {
+        return reply_comp(ctx, c, "That incident belongs to a different server.").await;
+    }
     let gid = GuildId::new(inc.guild_id);
     let uid = UserId::new(inc.user_id);
     match kind {
@@ -306,9 +311,21 @@ pub async fn component(ctx: &Context, c: &ComponentInteraction, p: &Pipeline) {
     }
 }
 
+/// S4: a component interaction only applies to an incident of the same guild.
+fn guild_matches(clicked_in: Option<u64>, incident_guild: u64) -> bool {
+    clicked_in == Some(incident_guild)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_guild_must_match_incident_guild() {
+        assert!(guild_matches(Some(1), 1));
+        assert!(!guild_matches(Some(2), 1), "click in another guild");
+        assert!(!guild_matches(None, 1), "DM or unknown context");
+    }
 
     #[test]
     fn manage_own_guild_needs_gate() {
