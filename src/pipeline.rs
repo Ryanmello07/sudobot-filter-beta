@@ -129,6 +129,11 @@ impl Pipeline {
         &self.d.store
     }
 
+    /// Expose the sink's hierarchy/owner check for the manual mod-log buttons.
+    pub async fn check_can_act(&self, guild: u64, user: u64) -> Result<(), String> {
+        self.d.sink.can_act(guild, user).await
+    }
+
     /// Mod-log destination for a guild: the DB override (set via `/guard logchannel`)
     /// wins over the config.toml default.
     pub async fn effective_log_channel(&self, guild: u64) -> Option<u64> {
@@ -358,6 +363,9 @@ impl Pipeline {
                     tier: tier.name().into(),
                     label: verdict.label.name().into(),
                     score: verdict.score,
+                    spam_score: verdict.spam_score,
+                    abuse_score: verdict.abuse_score,
+                    agreeing_sources: verdict.agreeing_sources,
                     planned: planned.name().into(),
                     taken: taken.clone(),
                     observe: taken == "would-have",

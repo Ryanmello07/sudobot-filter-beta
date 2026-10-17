@@ -258,6 +258,35 @@ async fn reply_comp(ctx: &Context, c: &ComponentInteraction, text: &str) {
     }
 }
 
+/// Gate for the manual mod-log buttons (ban/kick/timeout). Pure: the guild match
+/// (S4) is checked by the caller, and the hierarchy/owner check result comes in as
+/// `can_act`. Returns the action name on success, or a user-facing error message.
+fn manual_action_gate(
+    kind: &str,
+    admin: bool,
+    perms: Permissions,
+    action_taken: &str,
+    outcome: &str,
+    can_act: &Result<(), String>,
+) -> Result<&'static str, String> {
+    let (action, perm, perm_name) = match kind {
+        "ban" => ("ban", Permissions::BAN_MEMBERS, "Ban Members"),
+        "kick" => ("kick", Permissions::KICK_MEMBERS, "Kick Members"),
+        "timeout" => ("timeout", Permissions::MODERATE_MEMBERS, "Moderate Members"),
+        _ => return Err("Unknown action.".into()),
+    };
+    if matches!(action_taken, "ban" | "kick" | "delete+timeout") || outcome.starts_with("manual ") {
+        return Err("This incident was already actioned.".into());
+    }
+    if !admin && !perms.contains(perm) {
+        return Err(format!("You need the {perm_name} permission to {action} members."));
+    }
+    if let Err(why) = can_act {
+        return Err(format!("Cannot {action} that member: {why}."));
+    }
+    Ok(action)
+}
+
 pub async fn component(ctx: &Context, c: &ComponentInteraction, p: &Pipeline) {
     let Some((kind, id)) = c.data.custom_id.split_once(':') else { return };
     let Ok(id) = id.parse::<i64>() else { return };
@@ -274,6 +303,49 @@ pub async fn component(ctx: &Context, c: &ComponentInteraction, p: &Pipeline) {
     let gid = GuildId::new(inc.guild_id);
     let uid = UserId::new(inc.user_id);
     match kind {
+        "ban" | "kick" | "timeout" => {
+            let can = p.check_can_act(inc.guild_id, inc.user_id).await;
+            let action = match manual_action_gate(kind, admin, perms, &inc.action_taken, &inc.outcome, &can) {
+                Ok(a) => a,
+                Err(e) => return reply_comp(ctx, c, &e).await,
+            };
+            let reason = format!("chat guard: manual {action} via mod-log (incident #{id}, {} {:.2})", inc.label, inc.score);
+            let gc = p.effective_guild_config(inc.guild_id).await;
+            let res: Result<String, String> = match action {
+                "ban" => {
+                    // serenity deletes history in whole days; any positive setting becomes one day.
+                    let days = if gc.ladder.ban_delete_seconds > 0 { 1 } else { 0 };
+                    gid.ban_with_reason(&ctx.http, uid, days, &reason).await.map(|_| "Banned".to_string()).map_err(|e| e.to_string())
+                }
+                "kick" => gid.kick_with_reason(&ctx.http, uid, &reason).await.map(|_| "Kicked".to_string()).map_err(|e| e.to_string()),
+                _ => {
+                    let mins = gc.ladder.timeout_minutes;
+                    let until = chrono::Utc::now() + chrono::Duration::minutes(mins as i64);
+                    match Timestamp::from_unix_timestamp(until.timestamp()) {
+                        Ok(ts) => gid
+                            .edit_member(&ctx.http, uid, EditMember::new().disable_communication_until_datetime(ts).audit_log_reason(&reason))
+                            .await
+                            .map(|_| format!("Timed out for {mins} minutes"))
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            };
+            match res {
+                Ok(what) => {
+                    let who = c.user.id.get();
+                    let _ = p.store().set_outcome(id, &format!("manual {action} by {who}")).await;
+                    // Annotate the original embed message (the embed itself is untouched).
+                    let msg = &c.message;
+                    let _ = msg
+                        .channel_id
+                        .edit_message(&ctx.http, msg.id, EditMessage::new().content(format!("{what} manually by <@{who}> (incident #{id})")))
+                        .await;
+                    reply_comp(ctx, c, &format!("{what} <@{}>.", inc.user_id)).await
+                }
+                Err(e) => reply_comp(ctx, c, &format!("Could not {action}: {e}")).await,
+            }
+        }
         "undo" => {
             let who = c.user.id.get();
             let res: Result<&str, String> = match inc.action_taken.as_str() {
@@ -325,6 +397,32 @@ mod tests {
         assert!(guild_matches(Some(1), 1));
         assert!(!guild_matches(Some(2), 1), "click in another guild");
         assert!(!guild_matches(None, 1), "DM or unknown context");
+    }
+
+    #[test]
+    fn manual_action_gate_branches() {
+        let ok: Result<(), String> = Ok(());
+        let owner: Result<(), String> = Err("target is the server owner".into());
+        // happy paths: exact permission, and admin override
+        assert_eq!(manual_action_gate("ban", false, Permissions::BAN_MEMBERS, "flag", "open", &ok), Ok("ban"));
+        assert_eq!(manual_action_gate("kick", false, Permissions::KICK_MEMBERS, "flag", "open", &ok), Ok("kick"));
+        assert_eq!(manual_action_gate("timeout", false, Permissions::MODERATE_MEMBERS, "flag", "open", &ok), Ok("timeout"));
+        assert_eq!(manual_action_gate("ban", true, Permissions::empty(), "flag", "open", &ok), Ok("ban"), "administrator overrides");
+        // lacking permission
+        let e = manual_action_gate("ban", false, Permissions::empty(), "flag", "open", &ok).unwrap_err();
+        assert!(e.contains("Ban Members"), "{e}");
+        assert!(manual_action_gate("kick", false, Permissions::BAN_MEMBERS, "flag", "open", &ok).is_err(), "wrong permission");
+        // already actioned, by the bot or manually
+        let e = manual_action_gate("ban", true, Permissions::empty(), "ban", "open", &ok).unwrap_err();
+        assert!(e.contains("already actioned"), "{e}");
+        assert!(manual_action_gate("kick", true, Permissions::empty(), "flag", "manual ban by 9", &ok).unwrap_err().contains("already actioned"));
+        assert!(manual_action_gate("timeout", true, Permissions::empty(), "delete+timeout", "open", &ok).unwrap_err().contains("already actioned"));
+        assert!(manual_action_gate("ban", true, Permissions::empty(), "would-have", "observe", &ok).is_ok(), "observe outcome is not final");
+        // hierarchy / owner target (from can_act)
+        let e = manual_action_gate("ban", true, Permissions::empty(), "flag", "open", &owner).unwrap_err();
+        assert!(e.contains("server owner"), "{e}");
+        // unknown kind
+        assert!(manual_action_gate("smite", true, Permissions::ADMINISTRATOR, "flag", "open", &ok).is_err());
     }
 
     #[test]
