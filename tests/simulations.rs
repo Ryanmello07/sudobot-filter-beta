@@ -365,10 +365,11 @@ fn evasion_corpus_current_coverage() {
     // (technique, text, flagged today with allowed_invites = ["abc123"])
     let invite_cases: &[(&str, &str, bool)] = &[
         ("allowlisted exact", "join discord.gg/abc123", false),
-        ("allowlisted other case", "join discord.gg/ABC123", false), // S8: case-insensitive today
+        ("allowlisted other case", "join discord.gg/ABC123", true), // S8 fixed: codes are case-sensitive
         ("unknown code", "join discord.gg/other999", true),
         ("discord.com/invite", "join https://discord.com/invite/abc123", false),
         ("dsc.gg shortener", "join dsc.gg/abc123", false),
+        ("zero-width in invite host", "join disc\u{200B}ord.gg/abc123", true), // evasion flags regardless of allowlist
         ("mixed with text", "hey everyone join discord.gg/other999 for fun", true),
     ];
     for (tech, text, want) in invite_cases {

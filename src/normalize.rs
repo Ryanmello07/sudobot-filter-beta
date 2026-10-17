@@ -94,9 +94,11 @@ pub fn extract_domains(text: &str) -> Vec<String> {
     out
 }
 
+/// Invite codes from the RAW text, preserving case: Discord invite codes are
+/// case-sensitive, so allowlist comparisons must not see a lowercased code.
+/// (The regex still matches the invite host case-insensitively.)
 pub fn extract_invite_codes(text: &str) -> Vec<String> {
-    let n = normalize(text);
-    invite_re().captures_iter(&n).map(|c| c[1].to_string()).collect()
+    invite_re().captures_iter(text).map(|c| c[1].to_string()).collect()
 }
 
 pub fn contains_url(text: &str) -> bool {
@@ -137,8 +139,9 @@ mod tests {
 
     #[test]
     fn extracts_invites() {
+        // codes keep their original case (they are case-sensitive in Discord)
         let c = extract_invite_codes("join discord.gg/AbC123 or https://discord.com/invite/xyz");
-        assert_eq!(c, vec!["abc123".to_string(), "xyz".to_string()]);
+        assert_eq!(c, vec!["AbC123".to_string(), "xyz".to_string()]);
     }
 
     #[test]
