@@ -259,9 +259,13 @@ impl Pipeline {
         let mut jev: Option<JevResult> = None;
         if plan.providers && !combined.trim().is_empty() {
             let state = self.jev_state(&m, &profile, &ocr_text, &recent, now);
+            // The Jev cache key carries author context (tier + account-age bucket in
+            // hours) so a verdict for a brand-new account is never reused for an
+            // established one posting the same text.
+            let jev_ctx = format!("{}:{}", tier.name(), (now - m.profile.account_created).num_hours());
             let (p, j) = tokio::join!(
                 self.run_paxmod(&m, &combined, prio, now, &mut failures),
-                self.run_jev(g, &combined, state, prio, now)
+                self.run_jev(g, &combined, state, prio, now, &jev_ctx)
             );
             let (pr, pc) = p;
             let (jr, jc, jf) = j;
@@ -444,8 +448,11 @@ impl Pipeline {
         }
     }
 
-    async fn run_jev(&self, guild: u64, text: &str, state: JevState, prio: Priority, now: DateTime<Utc>) -> (Option<JevResult>, Cov, Vec<String>) {
-        let key = hash_text(&normalize(text));
+    /// `cache_ctx` binds the cache entry to the author's trust context (tier and
+    /// account-age bucket), so identical text from different author contexts costs
+    /// separate calls and cannot share a verdict.
+    async fn run_jev(&self, guild: u64, text: &str, state: JevState, prio: Priority, now: DateTime<Utc>, cache_ctx: &str) -> (Option<JevResult>, Cov, Vec<String>) {
+        let key = hash_text(&format!("{cache_ctx}\n{}", normalize(text)));
         if let Some(hit) = self.jev_cache.get(&key) {
             return (Some(hit), Cov::Ran, vec![]);
         }
@@ -1239,14 +1246,11 @@ mod tests {
         assert_eq!(row.action_taken, "delete+timeout", "stored action_taken must survive reprocessing");
     }
 
-    // Regression S2: the Jev cache key is hash(normalize(text)) only, so identical
-    // text from authors with different tiers/account ages shares one cached verdict
-    // even though the JevState sent to the API carries account_age_days and
-    // minutes_in_guild. Desired: the cache key also covers author context, so two
-    // different authors cost two calls. NOTE: jev_cache is private, so this asserts
-    // the observable consequence (Jev call count) rather than the key itself.
+    // Regression S2 (fixed): the Jev cache key includes author context (tier and
+    // account-age bucket), so identical text from a 2h-old and a 20h-old quarantine
+    // account no longer shares one cached verdict. Asserted at the observable level
+    // (Jev call count) because jev_cache is private.
     #[tokio::test]
-    #[ignore = "S2: Jev cache key ignores author context (tier, account age)"]
     async fn s2_jev_cache_key_includes_author_context() {
         let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
         h.p.handle(msg(1, 7, "check this out", profile(7, 2, 3)), Utc::now()).await; // 2h-old account
