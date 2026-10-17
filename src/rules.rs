@@ -292,11 +292,9 @@ mod tests {
         assert!(t.snapshot(1, 2, now()).is_empty());
     }
 
-    // Regression S3: "evil.com." (trailing-dot FQDN) is the same host as "evil.com"
-    // and must match blocked_domains. extract_domains currently keeps the trailing
-    // dot, so neither the exact match nor the ".{blocked}" suffix match fires.
+    // Regression S3 (fixed): "evil.com." (trailing-dot FQDN) is the same host as
+    // "evil.com" and matches blocked_domains; extract_domains trims trailing dots.
     #[test]
-    #[ignore = "S3: trailing-dot domains do not match blocked_domains"]
     fn s3_trailing_dot_domain_matches_blocked() {
         let g = GuildConfig { blocked_domains: vec!["evil.com".into()], ..Default::default() };
         let rc = RuleConfig::default();
