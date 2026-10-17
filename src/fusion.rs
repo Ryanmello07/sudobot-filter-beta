@@ -53,7 +53,12 @@ pub fn fuse(inp: &Inputs, cfg: &FusionConfig, clean_below: f64) -> Verdict {
     let mut evidence = vec![];
 
     if let Some(l) = inp.local {
-        spam_terms.push(cfg.w_local * l.score);
+        // When no other source contributed, the local score stands on its own:
+        // applying w_local would cap local-only verdicts at 0.6, below the quarantine
+        // delete threshold — even flagging would be unreachable during a provider
+        // outage. Multi-source fusion is unchanged (the weight still applies then).
+        let w = if inp.paxmod.is_none() && inp.jev.is_none() { 1.0 } else { cfg.w_local };
+        spam_terms.push(w * l.score);
         if l.score >= 0.5 {
             agreeing += 1;
         }
@@ -230,15 +235,11 @@ mod tests {
         assert!(!v.evidence.iter().any(|e| e.contains("Harassment")));
     }
 
-    // Regression M1: the fused score is capped by the source weight. A local-only
-    // verdict can never exceed w_local (0.6), and any realistic local score lands
-    // just UNDER the quarantine delete threshold (0.60): every rule firing at once
-    // gives a local score of ~0.9994, fusing to ~0.5996. So the strongest possible
-    // local-only detection can delete only after floating-point luck, and realistic
-    // maximal detections never can. Desired: a maximal local-only score reaches at
-    // least the quarantine delete threshold.
+    // Regression M1 (fixed): a local-only verdict is no longer capped by w_local —
+    // with no other source contributing, the local score fuses at full strength, so
+    // flag/delete stay reachable during provider outages. Multi-source math is
+    // unchanged (see sources_combine_noisy_or).
     #[test]
-    #[ignore = "M1: single-source fused score is capped below the quarantine delete threshold"]
     fn m1_local_only_max_score_reaches_quarantine_delete_threshold() {
         let delete = crate::config::LadderConfig::default().quarantine.delete.unwrap();
         // Sanity floor: an idealized local score of exactly 1.0 fuses to w_local.
