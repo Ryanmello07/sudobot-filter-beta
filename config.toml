@@ -53,38 +53,43 @@ local_hit_threshold = 0.30
 fresh_sample_rate = 0.25
 established_sample_rate = 0.05
 
+# Trust model (owner's choice): Paxmod drives actions, Jev is report-only.
+# w_paxmod = 1.0: paxmod >= 0.50 alone reaches the timeout rung.
+# w_jev = 0.45: a max-confidence Jev verdict (1.0 x 0.45 = 0.45) crosses only the
+# 0.40 flag rung — it creates a mod-log report but can never delete or timeout
+# on its own. Jev still runs on every scanned message and shows in the evidence.
+# w_local applies when local rules combine with providers; when providers are
+# down entirely, local rules stand on their own (outage fallback).
 [defaults.fusion]
 w_local = 0.6
-w_paxmod = 0.9
-w_jev = 0.9
+w_paxmod = 1.0
+w_jev = 0.45
 
 [defaults.ladder]
-timeout_minutes = 60
-ban_delete_seconds = 3600   # Discord deletes in whole days; any value > 0 means 1 day
+timeout_minutes = 10080   # 7 days
+ban_delete_seconds = 3600 # unused: ban is disabled below
 sweep_minutes = 10
 strike_days = 30
 enable_delete = true
 enable_timeout = true
-enable_kick = true
-enable_ban = true
+enable_kick = false       # manual only, via mod-log buttons
+enable_ban = false        # manual only, via mod-log buttons
 repeat_offender_single_source = false
 
-# Fused-score thresholds per tier. Omit kick/ban to disable them for that tier.
+# Fused-score thresholds per tier. Same policy for every tier:
+# >= 0.40 flag (mod-log report), >= 0.50 delete + 7-day timeout.
+# Kick/ban rungs omitted entirely: the bot never kicks or bans on its own.
 [defaults.ladder.quarantine]
 flag = 0.40
-delete = 0.60
-timeout = 0.70
-kick = 0.85
-ban = 0.95
+delete = 0.50
+timeout = 0.50
 
 [defaults.ladder.fresh]
-flag = 0.50
-delete = 0.70
-timeout = 0.80
-kick = 0.92
-ban = 0.97
+flag = 0.40
+delete = 0.50
+timeout = 0.50
 
 [defaults.ladder.established]
-flag = 0.65
-delete = 0.85
-timeout = 0.92
+flag = 0.40
+delete = 0.50
+timeout = 0.50
