@@ -119,12 +119,13 @@ fn incident_embed(r: &IncidentReport) -> CreateEmbed {
 
 fn incident_buttons(r: &IncidentReport) -> Vec<CreateButton> {
     let id = r.incident_id;
-    vec![
-        CreateButton::new(format!("safe:{id}")).label("Mark safe").style(ButtonStyle::Success),
-        CreateButton::new(format!("timeout:{id}")).label("Timeout").style(ButtonStyle::Secondary),
-        CreateButton::new(format!("kick:{id}")).label("Kick").style(ButtonStyle::Primary),
-        CreateButton::new(format!("ban:{id}")).label("Ban").style(ButtonStyle::Danger),
-    ]
+    let mut buttons = vec![CreateButton::new(format!("safe:{id}")).label("Mark safe").style(ButtonStyle::Success)];
+    if r.taken != "delete+timeout" {
+        buttons.push(CreateButton::new(format!("timeout:{id}")).label("Timeout").style(ButtonStyle::Secondary));
+    }
+    buttons.push(CreateButton::new(format!("kick:{id}")).label("Kick").style(ButtonStyle::Primary));
+    buttons.push(CreateButton::new(format!("ban:{id}")).label("Ban").style(ButtonStyle::Danger));
+    buttons
 }
 
 #[async_trait]
@@ -202,6 +203,21 @@ mod tests {
             failures: vec![],
             swept: 0,
         }
+    }
+
+    #[test]
+    fn buttons_hide_timeout_after_auto_timeout() {
+        let ids = |r: &IncidentReport| -> Vec<String> {
+            incident_buttons(r)
+                .iter()
+                .map(|b| serde_json::to_value(b).unwrap()["custom_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&report("delete+timeout", false)), ["safe:123", "kick:123", "ban:123"]);
+        let all = ["safe:123", "timeout:123", "kick:123", "ban:123"];
+        assert_eq!(ids(&report("flag", false)), all);
+        assert_eq!(ids(&report("delete", false)), all);
+        assert_eq!(ids(&report("would-have", true)), all);
     }
 
     #[test]
