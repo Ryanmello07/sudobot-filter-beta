@@ -350,11 +350,16 @@ fn manual_action_gate(
         "timeout" => ("timeout", Permissions::MODERATE_MEMBERS, "Moderate Members"),
         _ => return Err("Unknown action.".into()),
     };
-    if matches!(action_taken, "ban" | "kick") || outcome.starts_with("manual ") {
+    if matches!(action_taken, "ban" | "kick") || outcome.starts_with("manual ban") || outcome.starts_with("manual kick") {
         return Err("This incident was already actioned.".into());
     }
-    if kind == "timeout" && action_taken == "delete+timeout" {
-        return Err("This member was already timed out by the bot.".into());
+    if kind == "timeout" {
+        if action_taken == "delete+timeout" {
+            return Err("This member was already timed out by the bot.".into());
+        }
+        if outcome.starts_with("manual timeout") {
+            return Err("This member was already timed out.".into());
+        }
     }
     if !admin && !perms.contains(perm) {
         return Err(format!("You need the {perm_name} permission to {action} members."));
@@ -494,6 +499,11 @@ mod tests {
         assert_eq!(manual_action_gate("ban", true, Permissions::empty(), "delete+timeout", "open", &ok), Ok("ban"), "ban allowed after auto-timeout");
         assert_eq!(manual_action_gate("kick", true, Permissions::empty(), "delete+timeout", "open", &ok), Ok("kick"), "kick allowed after auto-timeout");
         assert!(manual_action_gate("ban", true, Permissions::empty(), "would-have", "observe", &ok).is_ok(), "observe outcome is not final");
+        assert_eq!(manual_action_gate("kick", true, Permissions::empty(), "flag", "manual timeout by 9", &ok), Ok("kick"));
+        assert_eq!(manual_action_gate("ban", true, Permissions::empty(), "flag", "manual timeout by 9", &ok), Ok("ban"));
+        assert!(manual_action_gate("timeout", true, Permissions::empty(), "flag", "manual timeout by 9", &ok).unwrap_err().contains("already timed out"));
+        assert!(manual_action_gate("kick", true, Permissions::empty(), "flag", "manual ban by 9", &ok).unwrap_err().contains("already actioned"));
+        assert!(manual_action_gate("ban", true, Permissions::empty(), "flag", "manual kick by 9", &ok).unwrap_err().contains("already actioned"));
         // hierarchy / owner target (from can_act)
         let e = manual_action_gate("ban", true, Permissions::empty(), "flag", "open", &owner).unwrap_err();
         assert!(e.contains("server owner"), "{e}");

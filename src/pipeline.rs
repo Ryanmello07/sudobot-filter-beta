@@ -159,7 +159,11 @@ impl Pipeline {
     /// Lift the timeout the bot applied for this incident. Does nothing for incidents
     /// where the bot did not time the member out.
     pub async fn lift_bot_timeout(&self, inc: &IncidentRow, moderator: u64) -> Release {
-        if inc.action_taken != "delete+timeout" {
+        // A failed delete+timeout may still have muted the member (only the delete failed);
+        // a null PATCH is harmless if the timeout never landed.
+        let maybe_timed_out = inc.action_taken == "delete+timeout"
+            || (inc.action_taken == "failed" && inc.action_planned == "delete+timeout");
+        if !maybe_timed_out || inc.outcome.starts_with("manual ban") || inc.outcome.starts_with("manual kick") {
             return Release::NotTimedOut;
         }
         let reason = format!("Timeout lifted: marked safe by moderator {moderator} (incident #{})", inc.id);
@@ -903,6 +907,7 @@ mod tests {
         log: Mutex<Vec<String>>,
         refuse: bool,
         fail_untimeout: bool,
+        fail_delete: bool,
     }
     impl FakeSink {
         fn has(&self, s: &str) -> bool {
@@ -921,6 +926,9 @@ mod tests {
             if self.refuse { Err("role hierarchy".into()) } else { Ok(()) }
         }
         async fn delete(&self, c: u64, m: u64) -> anyhow::Result<()> {
+            if self.fail_delete {
+                return Err(anyhow::anyhow!("missing access"));
+            }
             self.log.lock().unwrap().push(format!("delete {c} {m}"));
             Ok(())
         }
@@ -1138,6 +1146,53 @@ mod tests {
             assert_eq!(h.p.lift_bot_timeout(&row, 99).await, Release::NotTimedOut, "{taken}");
         }
         assert_eq!(h.sink.count("untimeout"), 0);
+    }
+
+    fn incident_row(planned: &str, taken: &str, outcome: &str) -> crate::store::IncidentRow {
+        crate::store::IncidentRow {
+            id: 1,
+            guild_id: 1,
+            user_id: 7,
+            channel_id: 1,
+            message_id: 1,
+            tier: "fresh".into(),
+            label: "spam".into(),
+            score: 0.8,
+            action_planned: planned.into(),
+            action_taken: taken.into(),
+            outcome: outcome.into(),
+            text_excerpt: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_safe_lifts_timeout_when_delete_failed_but_timeout_landed() {
+        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink { fail_delete: true, ..Default::default() }).await;
+        let o = h.p.handle(msg(1000, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
+        assert_eq!(o.taken, "failed");
+        let row = h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap();
+        assert_eq!(row.action_taken, "failed");
+        assert_eq!(row.action_planned, "delete+timeout");
+        assert_eq!(h.p.lift_bot_timeout(&row, 99).await, Release::Lifted);
+        assert!(h.sink.has("untimeout 7"), "log: {:?}", h.sink.log.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn mark_safe_skips_failed_non_timeout_plans_and_refused_and_manual_removals() {
+        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        for (planned, taken, outcome) in [
+            ("delete", "failed", ""),
+            ("refused", "refused", ""),
+            ("delete+timeout", "refused", ""),
+            ("delete+timeout", "delete+timeout", "manual ban by 9"),
+            ("delete+timeout", "delete+timeout", "manual kick by 9"),
+        ] {
+            let row = incident_row(planned, taken, outcome);
+            assert_eq!(h.p.lift_bot_timeout(&row, 99).await, Release::NotTimedOut, "{planned}/{taken}/{outcome}");
+        }
+        assert_eq!(h.sink.count("untimeout"), 0);
+        let row = incident_row("delete+timeout", "delete+timeout", "manual timeout by 9");
+        assert_eq!(h.p.lift_bot_timeout(&row, 99).await, Release::Lifted);
     }
 
     #[tokio::test]
