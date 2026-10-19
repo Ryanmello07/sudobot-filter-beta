@@ -1,7 +1,7 @@
 //! `/guard status|mode` and the mod-log buttons.
 
 use crate::model::Mode;
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Pipeline, Release};
 use serenity::all::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -431,11 +431,20 @@ pub async fn component(ctx: &Context, c: &ComponentInteraction, p: &Pipeline) {
             let _ = p.store().set_allowlisted(inc.guild_id, inc.user_id, true).await;
             let _ = p.store().clear_strikes_for_incident(id).await;
             let _ = p.store().set_outcome(id, &format!("marked safe by {}", c.user.id.get())).await;
-            reply_comp(ctx, c, "Member added to the allowlist and the strike from this incident cleared.").await
+            let release = p.lift_bot_timeout(&inc, c.user.id.get()).await;
+            reply_comp(ctx, c, &safe_reply(&release)).await
         }
         // "undo" was removed: the manual Ban/Kick/Timeout buttons plus Mark safe
         // are the mod toolbox.
         _ => {}
+    }
+}
+
+fn safe_reply(r: &Release) -> String {
+    match r {
+        Release::NotTimedOut => "Member added to the allowlist and the strike from this incident cleared.".into(),
+        Release::Lifted => "Member added to the allowlist, the strike from this incident cleared, and the timeout lifted.".into(),
+        Release::Failed(e) => format!("Member added to the allowlist and the strike cleared, but the timeout could not be lifted ({e}). They may have left, or the timeout already expired."),
     }
 }
 
@@ -453,6 +462,15 @@ mod tests {
         assert!(guild_matches(Some(1), 1));
         assert!(!guild_matches(Some(2), 1), "click in another guild");
         assert!(!guild_matches(None, 1), "DM or unknown context");
+    }
+
+    #[test]
+    fn safe_reply_texts() {
+        assert_eq!(safe_reply(&Release::NotTimedOut), "Member added to the allowlist and the strike from this incident cleared.");
+        assert_eq!(safe_reply(&Release::Lifted), "Member added to the allowlist, the strike from this incident cleared, and the timeout lifted.");
+        let failed = safe_reply(&Release::Failed("unknown member".into()));
+        assert!(failed.contains("could not be lifted"), "{failed}");
+        assert!(failed.contains("unknown member"), "{failed}");
     }
 
     #[test]

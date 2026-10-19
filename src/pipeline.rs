@@ -13,7 +13,7 @@ use crate::ports::*;
 use crate::providers::jev::JevState;
 use crate::risk::{compute_tier, detection_plan, graduated, ocr_eligible, Plan, TierHints};
 use crate::rules::{evaluate, image_text_signals, MessageFacts, RecentMsg, RecentTracker};
-use crate::store::{NewIncident, Store};
+use crate::store::{IncidentRow, NewIncident, Store};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -123,6 +123,14 @@ pub fn timeout_reason(pax_reason: Option<&str>, label: &str, score: f64) -> Stri
     cut
 }
 
+/// Outcome of trying to lift the bot's own timeout when a moderator marks an incident safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Release {
+    NotTimedOut,
+    Lifted,
+    Failed(String),
+}
+
 impl Pipeline {
     pub fn new(d: Deps) -> Self {
         let jev_ttl = std::time::Duration::from_secs(d.cfg.runtime.jev_cache_ttl_secs);
@@ -146,6 +154,19 @@ impl Pipeline {
     /// Expose the sink's hierarchy/owner check for the manual mod-log buttons.
     pub async fn check_can_act(&self, guild: u64, user: u64) -> Result<(), String> {
         self.d.sink.can_act(guild, user).await
+    }
+
+    /// Lift the timeout the bot applied for this incident. Does nothing for incidents
+    /// where the bot did not time the member out.
+    pub async fn lift_bot_timeout(&self, inc: &IncidentRow, moderator: u64) -> Release {
+        if inc.action_taken != "delete+timeout" {
+            return Release::NotTimedOut;
+        }
+        let reason = format!("Timeout lifted: marked safe by moderator {moderator} (incident #{})", inc.id);
+        match self.d.sink.untimeout(inc.guild_id, inc.user_id, &reason).await {
+            Ok(()) => Release::Lifted,
+            Err(e) => Release::Failed(e.to_string()),
+        }
     }
 
     /// Post a notice to the guild's mod log (audit trace for manual actions).
@@ -1084,6 +1105,51 @@ mod tests {
         let v = o.verdict.as_ref().unwrap();
         let want = format!("timeout 7 60 | Automated Temporary Mute: {} {:.2}", v.label.name(), v.score);
         assert!(h.sink.has(&want), "log: {:?}", h.sink.log.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn mark_safe_lifts_bot_timeout() {
+        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(1000, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
+        assert_eq!(o.taken, "delete+timeout");
+        let row = h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap();
+        assert_eq!(h.p.lift_bot_timeout(&row, 99).await, Release::Lifted);
+        assert!(h.sink.has("untimeout 7"));
+    }
+
+    #[tokio::test]
+    async fn mark_safe_does_not_untimeout_other_incidents() {
+        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        for taken in ["flag", "would-have", "delete", "kick", "ban"] {
+            let row = crate::store::IncidentRow {
+                id: 1,
+                guild_id: 1,
+                user_id: 7,
+                channel_id: 1,
+                message_id: 1,
+                tier: "fresh".into(),
+                label: "spam".into(),
+                score: 0.8,
+                action_planned: "delete+timeout".into(),
+                action_taken: taken.into(),
+                outcome: String::new(),
+                text_excerpt: None,
+            };
+            assert_eq!(h.p.lift_bot_timeout(&row, 99).await, Release::NotTimedOut, "{taken}");
+        }
+        assert_eq!(h.sink.count("untimeout"), 0);
+    }
+
+    #[tokio::test]
+    async fn mark_safe_reports_failed_unmute() {
+        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink { fail_untimeout: true, ..Default::default() }).await;
+        let o = h.p.handle(msg(1000, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
+        assert_eq!(o.taken, "delete+timeout");
+        let row = h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap();
+        match h.p.lift_bot_timeout(&row, 99).await {
+            Release::Failed(e) => assert!(e.contains("unknown member"), "{e}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
