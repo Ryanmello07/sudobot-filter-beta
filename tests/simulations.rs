@@ -54,7 +54,10 @@ impl ActionSink for NopSink {
     async fn bulk_delete(&self, _: u64, _: &[u64]) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn timeout(&self, _: u64, _: u64, _: u32) -> anyhow::Result<()> {
+    async fn timeout(&self, _: u64, _: u64, _: u32, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn untimeout(&self, _: u64, _: u64, _: &str) -> anyhow::Result<()> {
         Ok(())
     }
     async fn kick(&self, _: u64, _: u64, _: &str) -> anyhow::Result<()> {

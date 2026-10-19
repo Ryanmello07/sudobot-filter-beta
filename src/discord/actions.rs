@@ -54,11 +54,18 @@ impl ActionSink for DiscordSink {
         Ok(())
     }
 
-    async fn timeout(&self, guild: u64, user: u64, minutes: u32) -> anyhow::Result<()> {
+    async fn timeout(&self, guild: u64, user: u64, minutes: u32, reason: &str) -> anyhow::Result<()> {
         let until = chrono::Utc::now() + chrono::Duration::minutes(minutes as i64);
         let ts = Timestamp::from_unix_timestamp(until.timestamp())?;
         GuildId::new(guild)
-            .edit_member(&self.http, UserId::new(user), EditMember::new().disable_communication_until_datetime(ts).audit_log_reason("sudobot-chat-guard"))
+            .edit_member(&self.http, UserId::new(user), EditMember::new().disable_communication_until_datetime(ts).audit_log_reason(reason))
+            .await?;
+        Ok(())
+    }
+
+    async fn untimeout(&self, guild: u64, user: u64, reason: &str) -> anyhow::Result<()> {
+        GuildId::new(guild)
+            .edit_member(&self.http, UserId::new(user), EditMember::new().enable_communication().audit_log_reason(reason))
             .await?;
         Ok(())
     }

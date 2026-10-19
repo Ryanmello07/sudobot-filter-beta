@@ -101,7 +101,8 @@ pub trait ActionSink: Send + Sync {
     async fn can_act(&self, guild: u64, user: u64) -> Result<(), String>;
     async fn delete(&self, channel: u64, message: u64) -> anyhow::Result<()>;
     async fn bulk_delete(&self, channel: u64, messages: &[u64]) -> anyhow::Result<()>;
-    async fn timeout(&self, guild: u64, user: u64, minutes: u32) -> anyhow::Result<()>;
+    async fn timeout(&self, guild: u64, user: u64, minutes: u32, reason: &str) -> anyhow::Result<()>;
+    async fn untimeout(&self, guild: u64, user: u64, reason: &str) -> anyhow::Result<()>;
     async fn kick(&self, guild: u64, user: u64, reason: &str) -> anyhow::Result<()>;
     async fn ban(&self, guild: u64, user: u64, delete_seconds: u32, reason: &str) -> anyhow::Result<()>;
 }

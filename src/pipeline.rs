@@ -109,6 +109,20 @@ fn trunc(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Audit-log reason for an automatic timeout, capped at Discord's 512 characters.
+pub fn timeout_reason(pax_reason: Option<&str>, label: &str, score: f64) -> String {
+    const MAX: usize = 512;
+    let collapsed = pax_reason.map(|r| r.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    let detail = if collapsed.is_empty() { format!("{label} {score:.2}") } else { collapsed };
+    let full = format!("Automated Temporary Mute: {detail}");
+    if full.chars().count() <= MAX {
+        return full;
+    }
+    let mut cut = trunc(&full, MAX - 1);
+    cut.push('…');
+    cut
+}
+
 impl Pipeline {
     pub fn new(d: Deps) -> Self {
         let jev_ttl = std::time::Duration::from_secs(d.cfg.runtime.jev_cache_ttl_secs);
@@ -316,7 +330,8 @@ impl Pipeline {
             } else if self.d.store.incident_exists(g, m.message_id).await {
                 taken = "already".into();
             } else {
-                let r = self.execute(&m, tier, planned, now, &mut failures).await;
+                let reason = timeout_reason(pax.as_ref().filter(|p| p.flagged).and_then(|p| p.reason.as_deref()), verdict.label.name(), verdict.score);
+                let r = self.execute(&m, tier, planned, now, &mut failures, &reason).await;
                 taken = r.0;
                 swept = r.1;
                 strike = r.2;
@@ -601,7 +616,7 @@ impl Pipeline {
         tasks.push(h);
     }
 
-    async fn execute(&self, m: &IncomingMessage, tier: Tier, action: Action, now: DateTime<Utc>, failures: &mut Vec<String>) -> (String, usize, Option<&'static str>) {
+    async fn execute(&self, m: &IncomingMessage, tier: Tier, action: Action, now: DateTime<Utc>, failures: &mut Vec<String>, timeout_reason: &str) -> (String, usize, Option<&'static str>) {
         let g = m.guild_id;
         let gc = self.effective_guild_config(g).await;
         let l = &gc.ladder;
@@ -621,7 +636,7 @@ impl Pipeline {
             }
         }
         match action {
-            Action::DeleteTimeout => match s.timeout(g, m.author_id, l.timeout_minutes).await {
+            Action::DeleteTimeout => match s.timeout(g, m.author_id, l.timeout_minutes, timeout_reason).await {
                 Ok(()) => strike = Some("timeout"),
                 Err(e) => {
                     failures.push(format!("timeout failed: {e}"));
@@ -784,6 +799,16 @@ mod tests {
             *f.result.lock().unwrap() = Some(Ok(PaxmodResult { categories: [("Spam".to_string(), score)].into(), ..Default::default() }));
             f
         }
+        fn spam_flagged(score: f64, reason: &str) -> Arc<Self> {
+            let f = Arc::new(FakePax::default());
+            *f.result.lock().unwrap() = Some(Ok(PaxmodResult {
+                categories: [("Spam".to_string(), score)].into(),
+                flagged: true,
+                reason: Some(reason.into()),
+                ..Default::default()
+            }));
+            f
+        }
         fn failing() -> Arc<Self> {
             let f = Arc::new(FakePax::default());
             *f.result.lock().unwrap() = Some(Err(ProviderError::Server(503)));
@@ -856,6 +881,7 @@ mod tests {
     struct FakeSink {
         log: Mutex<Vec<String>>,
         refuse: bool,
+        fail_untimeout: bool,
     }
     impl FakeSink {
         fn has(&self, s: &str) -> bool {
@@ -881,8 +907,15 @@ mod tests {
             self.log.lock().unwrap().push(format!("bulk {c} {m:?}"));
             Ok(())
         }
-        async fn timeout(&self, _g: u64, u: u64, mins: u32) -> anyhow::Result<()> {
-            self.log.lock().unwrap().push(format!("timeout {u} {mins}"));
+        async fn timeout(&self, _g: u64, u: u64, mins: u32, reason: &str) -> anyhow::Result<()> {
+            self.log.lock().unwrap().push(format!("timeout {u} {mins} | {reason}"));
+            Ok(())
+        }
+        async fn untimeout(&self, _g: u64, u: u64, _reason: &str) -> anyhow::Result<()> {
+            if self.fail_untimeout {
+                return Err(anyhow::anyhow!("unknown member"));
+            }
+            self.log.lock().unwrap().push(format!("untimeout {u}"));
             Ok(())
         }
         async fn kick(&self, _g: u64, u: u64, _r: &str) -> anyhow::Result<()> {
@@ -1018,6 +1051,39 @@ mod tests {
         assert_eq!(h.log.incidents.lock().unwrap().len(), 1);
         // strike recorded, so the next message is escalated
         assert_eq!(h.p.store().history(1, 7, now).await.unwrap().active_strikes, 1);
+    }
+
+    #[test]
+    fn timeout_reason_formats_and_caps() {
+        let p = "Automated Temporary Mute: ";
+        assert_eq!(timeout_reason(Some("crypto drainer tactic"), "spam", 0.81), format!("{p}crypto drainer tactic"));
+        assert_eq!(timeout_reason(None, "spam", 0.81), format!("{p}spam 0.81"));
+        assert_eq!(timeout_reason(Some("   \n  "), "abuse", 0.5), format!("{p}abuse 0.50"));
+        assert_eq!(timeout_reason(Some("line one\nline two   spaced"), "spam", 0.9), format!("{p}line one line two spaced"));
+
+        let long = timeout_reason(Some(&"é".repeat(600)), "spam", 0.9);
+        assert_eq!(long.chars().count(), 512);
+        assert!(long.ends_with('…'));
+        assert!(long.starts_with(p));
+
+        let exact = timeout_reason(Some(&"x".repeat(512 - p.chars().count())), "spam", 0.9);
+        assert_eq!(exact.chars().count(), 512);
+        assert!(!exact.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn auto_timeout_uses_paxmod_reason_in_audit_log() {
+        let h = harness(FakePax::spam_flagged(0.8, "crypto drainer tactic"), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(1000, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
+        assert_eq!(o.taken, "delete+timeout");
+        assert!(h.sink.has("timeout 7 60 | Automated Temporary Mute: crypto drainer tactic"));
+
+        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(1001, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
+        assert_eq!(o.taken, "delete+timeout");
+        let v = o.verdict.as_ref().unwrap();
+        let want = format!("timeout 7 60 | Automated Temporary Mute: {} {:.2}", v.label.name(), v.score);
+        assert!(h.sink.has(&want), "log: {:?}", h.sink.log.lock().unwrap());
     }
 
     #[tokio::test]
