@@ -11,7 +11,7 @@ use crate::normalize::{contains_url, hash_bytes, hash_text, normalize};
 use crate::policy::{decide, flag_threshold};
 use crate::ports::*;
 use crate::providers::jev::JevState;
-use crate::risk::{compute_tier, detection_plan, graduated, Plan, TierHints};
+use crate::risk::{compute_tier, detection_plan, graduated, ocr_eligible, Plan, TierHints};
 use crate::rules::{evaluate, image_text_signals, MessageFacts, RecentMsg, RecentTracker};
 use crate::store::{NewIncident, Store};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -243,7 +243,8 @@ impl Pipeline {
         // ---- plan ----
         let grad = graduated(tier, &history, &gc.tiers);
         let weak_image = !m.image_urls.is_empty() && (m.content.trim().chars().count() < 10 || has_link || m.distinct_mentions > 0);
-        let plan = detection_plan(tier, grad, local.score, weak_image, (self.d.roll)(), &gc.plan);
+        let mut plan = detection_plan(tier, grad, local.score, weak_image, (self.d.roll)(), &gc.plan);
+        plan.ocr = plan.ocr && ocr_eligible(&profile, &gc.tiers, now);
         let prio = if tier == Tier::Quarantine || (tier == Tier::Fresh && !grad) { Priority::High } else { Priority::Low };
         self.maybe_feed(&m, tier, plan, now);
 
@@ -1173,17 +1174,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn established_plain_image_is_not_ocrd() {
+    async fn established_members_are_never_ocrd() {
         let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
         seed_clean(&h, 8).await;
         let mut m = msg(1, 8, "here is the picture from our trip yesterday", old_user(8));
         m.image_urls = vec!["https://cdn.discordapp.com/a.png".into()];
         h.p.handle(m, Utc::now()).await;
         assert_eq!(*h.ocr.calls.lock().unwrap(), 0);
-        // but an image-only message from an established member is
+        // not even for an image-only message
         let mut m = msg(2, 8, "", old_user(8));
         m.image_urls = vec!["https://cdn.discordapp.com/b.png".into()];
         h.p.handle(m, Utc::now()).await;
+        assert_eq!(*h.ocr.calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn sleeper_without_history_is_not_ocrd() {
+        let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        let mut m = msg(1, 8, "", old_user(8));
+        m.image_urls = vec!["https://cdn.discordapp.com/a.png".into()];
+        let o = h.p.handle(m, Utc::now()).await;
+        assert_eq!(o.tier, Tier::Fresh);
+        assert_eq!(*h.ocr.calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn time_young_fresh_member_is_ocrd() {
+        let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        let mut m = msg(1, 8, "", profile(8, 24 * 10, 60 * 24 * 2));
+        m.image_urls = vec!["https://cdn.discordapp.com/a.png".into()];
+        let o = h.p.handle(m, Utc::now()).await;
+        assert_eq!(o.tier, Tier::Fresh);
         assert_eq!(*h.ocr.calls.lock().unwrap(), 1);
     }
 

@@ -32,6 +32,11 @@ pub fn base_tier(p: &MemberProfile, cfg: &TierConfig, now: DateTime<Utc>) -> Tie
     }
 }
 
+/// OCR is reserved for newly joined accounts (time-based tier only; history is ignored) because images read out of context cause false positives.
+pub fn ocr_eligible(p: &MemberProfile, cfg: &TierConfig, now: DateTime<Utc>) -> bool {
+    matches!(base_tier(p, cfg, now), Tier::Quarantine | Tier::Fresh)
+}
+
 /// Order of operations: time-based `base_tier` → Trusted early return →
 /// **downgrade rule** (Established must be earned by history) → escalation
 /// (one step toward Quarantine from strikes / recent flags / join flag / risky
@@ -165,6 +170,30 @@ mod tests {
         // account exactly 30 days, in guild a long time + earned history -> established
         let p = profile(Duration::days(30), Duration::days(100));
         assert_eq!(tier(&p, &h, Default::default()), Tier::Established);
+    }
+
+    #[test]
+    fn ocr_eligible_only_for_time_young_members() {
+        let cfg = TierConfig::default();
+        let eligible = |p: &MemberProfile| ocr_eligible(p, &cfg, now());
+        // Quarantine
+        assert!(eligible(&profile(Duration::days(2000), Duration::minutes(5))));
+        // Fresh by days in guild
+        assert!(eligible(&profile(Duration::days(1000), Duration::days(3))));
+        // Fresh by young account
+        assert!(eligible(&profile(Duration::days(10), Duration::days(100))));
+        // old and long-joined: history-based Fresh downgrade must not make it eligible
+        assert!(!eligible(&profile(Duration::days(2000), Duration::days(365))));
+        // exactly 7 days in guild is no longer Fresh
+        assert!(!eligible(&profile(Duration::days(1000), Duration::days(7))));
+        // unknown join date falls back to account age only
+        let mut p = profile(Duration::days(1000), Duration::days(1));
+        p.joined_at = None;
+        assert!(!eligible(&p));
+        // trusted
+        let mut p = profile(Duration::days(1), Duration::minutes(1));
+        p.is_trusted = true;
+        assert!(!eligible(&p));
     }
 
     #[test]
