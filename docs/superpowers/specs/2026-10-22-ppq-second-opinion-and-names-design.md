@@ -11,13 +11,22 @@ The owner wants:
   - Jev (`typesafe/jev-1.13` on ppq), replacing the direct Typesafe API.
   - Perplexity (`perplexity/pplx-decider-v1.2` on ppq), new to the bot.
 
+## Why now: two false positives (2026-10-25)
+
+Owner priority, stated after these: **a wrong action on a legitimate member is much worse than a missed spam message.**
+
+- Incident #78 (ordinary GPU recommendation, account 4.8y old): Paxmod scored it 0.0. A weak local rule (`first_message_link`, 0.35 x 0.6) and Jev "promo" (0.97 x 0.45) combined through noisy-or to 0.555 and crossed the 0.50 delete+timeout line. "Report-only" Jev was not report-only once any local rule fired.
+- Incident #77 (`its working or not. <@id>`): Paxmod scored 1.0 under the 797-character policy ("tagging a user to initiate contact"). Reproduced live. Jev said legitimate. On 18 ordinary mention messages Paxmod wrongly blocked 2 (11%); Perplexity 0, Jev class 0; all three caught 6 of 6 scam messages that also use mentions.
+- Server history: every clear scam action (~20) had Jev scam/promo; every Paxmod-caused false action except one (#57, #58, #71, #77) had Jev "legitimate".
+
 ## Goals
 
 1. Name checks at join go to Jev and Perplexity (in parallel). Paxmod is never called for names.
 2. Jev and Perplexity both run in parallel, always, on all content the bot scans (messages including OCR text, and names), because they are cheap. This includes every message the plan sends to Paxmod.
 3. **Acting source order.** Only Paxmod can drive delete + timeout while it responds. If Paxmod produced no result for a message (over cap, circuit open, failed, timed out), Perplexity becomes the acting source on its own. If Perplexity also has no result, Jev becomes the acting source on its own. If none responded, local rules stand alone, as today.
 4. Models that are not the acting source are report-only: they show in the mod-log evidence and can raise a flag, never a delete or timeout.
-5. The Typesafe API client and its env vars go away; ppq is the single base URL and key for both models.
+5. **Corroboration gate (owner decision, option a).** Any automatic action above Flag (delete, timeout, kick, ban) requires a second source to agree with the acting source. If none does, the outcome is **flag only**: the message stays up, moderators see the incident with a note saying why, nobody is muted.
+6. The Typesafe API client and its env vars go away; ppq is the single base URL and key for both models.
 
 ## Non-goals / anti-goals
 
@@ -39,6 +48,9 @@ The owner wants:
 - **One acting source per verdict, others report-only.** Acting source = Paxmod, else Perplexity, else Jev, else local alone. The acting source's risk enters fusion at weight 1.0 (the `w_paxmod` pattern). Every other model's risk is report-only: its evidence is shown, and it may raise the score only up to the flag rung (below 0.50), never to delete or timeout. Report-only models do not stack with each other (the larger one counts). No new thresholds; the ladder is unchanged.
 - **Config weights.** The acting source's weight is read from config: `w_paxmod` (existing), new `w_pplx`, and existing `w_jev`. In the repo's `config.toml` all three are set to 1.0 (so `w_jev` changes from 0.45 to 1.0 and its comment is rewritten for the new rule); the code defaults for `w_pplx` and `w_jev` stay 0.9, like `w_paxmod`'s code default. A weight is only applied when that source is the acting source. Add `fusion.w_pplx` to the same `/guard config` allowlists and displays that list `fusion.w_jev` today. The live server's `config.toml` carries its own copy of these values; updating it is part of the deploy step (needs the owner's go-ahead), not the build.
 - **Report-only models never enter the noisy-or.** Let `base` = noisy-or of the local term and the acting source's term (as today, minus the report-only models). Report-only models contribute a separate term `r = min(max(their risks), CAP)` with `CAP = min(0.45, delete_threshold_of_tier - 0.01)`, and the final score is `max(base, r)`. So a report-only model can lift a message to the flag rung but can never combine with local rules to cross delete or timeout, and a guild override with a low delete threshold cannot break that guarantee. (Flag rungs above the cap in non-live code defaults simply mean report-only models do not flag there.)
+- **Corroborated** = some source other than the acting one has spam-or-abuse risk >= 0.5 (the existing "agrees" threshold), where "other source" is any of Paxmod, Perplexity, Jev, or the local rules score. Weak local rules (below 0.5) do not corroborate. Exception: when no model responded and local rules stand alone (full outage), the verdict is treated as corroborated so local-only behavior is unchanged. Stored as `Verdict.corroborated: bool`; `policy::decide` returns at most `Action::Flag` when it is false; the verdict evidence gets one line `note: no second source agreed; flag only`.
+- **Consequences I accept (change if you disagree):** while Paxmod is down, Perplexity can act only if Jev (or a local rule >= 0.5) agrees, i.e. the fallback is "both agree"; Jev acting as the third source can act only on a local rule >= 0.5, otherwise it flags. During a ppq outage Paxmod's hits become flag-only unless a local rule agrees. This is the cost of putting false positives first.
+- **Policy mention carve-out** is a separate follow-up (owner pastes into the Paxmod console): the policy must stop treating an ordinary `<@id>` mention or reply as "contacting a person", while still blocking "DM me"/"DM <@id>" pushes (incident history includes a real scam of the form `FREE SUPPORT SERVER ... DM <@id>`). Needs a mention test set run through real Paxmod before and after.
 - **Local rules** keep their current role and weights and still combine with the acting source via noisy-or. When the only live source is local, it stands alone as today.
 - **`agreeing_sources` counts only local and the acting source**, never report-only models, so the kick/ban "needs two sources" rule (disabled in the live config, enabled in code defaults) cannot be satisfied by report-only models. The verdict `label` may still use any model's class (for example a Jev or Perplexity `scam_phishing` class gives the Scam label) because it is display information; the builder must confirm the label does not influence which action is chosen, and if it does, restrict it to the acting source.
 - **Policy file.** Commit `policy.txt` at the repo root, seeded from `decision_bench/paxmod_prompt_candidate.txt` (the 797-character policy now live in Paxmod). Path overridable via `POLICY_FILE`. If the file is missing or empty at startup the bot logs a warning and runs both models without the `policy` question; the parser treats the `policy` answer as optional (the other five answers stay strictly required).
@@ -60,6 +72,9 @@ The owner wants:
   - Paxmod fails: Perplexity high -> delete+timeout even with Jev saying clean; Perplexity low and Jev high -> flag only;
   - Paxmod and Perplexity both unavailable: Jev high -> delete+timeout;
   - Paxmod responded with a low score + Perplexity and Jev both at full confidence -> never delete or timeout (flag at most);
+  - Incident #77 replay: Paxmod flagged at 1.0, both models legitimate, no local rule -> flag only, no delete, no timeout;
+  - Incident #78 replay: Paxmod 0.0, local `first_message_link`, Jev promo 0.97, Perplexity promo -> flag at most, no delete, no timeout;
+  - Paxmod flagged + one model agrees (>= 0.5) -> delete + timeout as before; Paxmod flagged + local rule >= 0.5 -> same;
   - both models are called for every provider-scanned message, and for names;
   - old `verdict_json` still parses.
 

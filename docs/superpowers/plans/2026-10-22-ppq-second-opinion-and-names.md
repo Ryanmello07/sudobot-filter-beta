@@ -17,6 +17,7 @@
 - Acting source order: Paxmod (any `Some` result, even degraded) → Perplexity → Jev → local alone. Acting weights come from config (`w_paxmod`, new `w_pplx`, `w_jev`); code defaults 0.9 each; repo `config.toml` sets all three to 1.0.
 - Report-only models never enter the noisy-or. Their term is `min(max(their risks), CAP)` with `CAP = min(0.45, lowest_action_rung_of_tier - 0.01)`; final spam/abuse score = `max(base, term)`.
 - `agreeing_sources` counts only local and the acting source.
+- **Corroboration gate (owner priority: a wrong action on a legitimate member is much worse than a missed spam):** any automatic action above `Flag` requires `Verdict.corroborated`. Corroborated = some source other than the acting one has spam-or-abuse risk >= 0.5 (local counts only at score >= 0.5); when no model responded and local rules stand alone, treated as corroborated. Not corroborated → `decide` returns at most `Action::Flag`, and the verdict evidence gets `note: no second source agreed; flag only`.
 - Name check: join reason if either model's spam risk >= 0.8. Name checks never kick or ban (existing).
 - Policy text from `POLICY_FILE`; missing/empty → warn and run without the `policy` question (parser treats `policy` / `name_bad` answers as optional; the other five answers stay strictly required).
 - Both models: own budget, circuit breaker, usage row (`pplx`), result cache (same TTL/key rule as Jev's), `Coverage.pplx` (serde default), `incidents.pplx_json` (nullable, migration `0004`).
@@ -25,11 +26,15 @@
 
 ## Review Focus
 
-1. Paxmod responds (clean, flagged, or degraded) while Perplexity and Jev both say block at full confidence and a local rule also fires: no delete, no timeout, flag at most. (Tasks 4, 5)
+1. The two live incidents, replayed: #77 (Paxmod 1.0, Jev legitimate, no local rule: flag only) and #78 (Paxmod 0.0, local `first_message_link` 0.35, Jev promo 0.97: flag at most). Also: Paxmod responds clean/flagged/degraded while Perplexity and Jev both say block at full confidence and a local rule fires: no delete, no timeout. (Tasks 4, 5)
 2. Perplexity errors (timeout, 429, malformed) while Paxmod is also down: Jev must act; Perplexity erroring while Paxmod responds changes nothing. (Task 5)
 3. `policy.txt` missing, empty, whitespace-only, or invalid UTF-8: bot still starts, requests omit the `policy` question. (Task 3)
 4. Blank or emoji-only names, names/messages longer than the truncation limits with multi-byte characters: no panic, blank names skip both model calls. (Tasks 2, 6)
 5. Existing databases and stored `verdict_json` rows without `pplx`: migration applies, old rows still deserialize. (Tasks 3, 5)
+
+## Execution order and release plan
+
+Run Task 1, then **Task 4 first**: it fixes the two live false positives using only what the bot already has (Paxmod + Jev + local) and is releasable on its own as a hotfix (owner go-ahead needed to deploy). Then Tasks 2, 3, 5, 6, 7 (ppq, Perplexity, names) as the second release, and Task 8 (policy mention carve-out) in parallel whenever the owner is ready to paste into the Paxmod console.
 
 ---
 
@@ -92,13 +97,12 @@ Independent of all code tasks; run first so the owner has the numbers early. Not
 - Produces:
   - `Env` fields: remove `typesafe_key`, `typesafe_base`; add `ppq_key: Secret`, `ppq_base: String`, `pplx_model: String`, `pplx_cap: u64`, `policy_file: String`; `jev_model` default becomes `"typesafe/jev-1.13"`
   - `pub fn load_policy(path: &str) -> Option<String>` in `config.rs`: `None` if the file is missing, unreadable, invalid UTF-8, or trims to empty; otherwise the trimmed text
-  - `FusionConfig.w_pplx: f64` (default 0.9), added next to every existing `w_jev` occurrence in `config.rs` (default impl, `/guard config` key lists and setters ~lines 360, 402, 418, 535, display ~587)
   - `Provider::Pplx` with `name() == "pplx"`
   - `Coverage.pplx: Cov` with `#[serde(default)]` on the struct so old JSON still parses
   - `Deps.pplx: Arc<dyn Classifier>`, `Budgets.pplx: Arc<Budget>`; main preloads `Provider::Pplx` usage like the others
 - Consumes: `PpqClient::new` from Task 2.
 
-- [ ] **Step 1: Write failing tests:** `load_policy_missing_empty_and_trimmed` (missing path → `None`; file with `"  \n"` → `None`; file with `" text \n"` → `Some("text")`; bytes `[0xff,0xfe]` → `None`) using `tempfile` or `std::env::temp_dir()` paths; `fusion_w_pplx_defaults_to_point_nine` (`FusionConfig::default().w_pplx == 0.9`); in `model.rs`: `old_coverage_json_without_pplx_deserializes` (`{"paxmod":"Ran","jev":"Ran","ocr":"Skipped"}` → ok, `pplx == Cov::Skipped`).
+- [ ] **Step 1: Write failing tests:** `load_policy_missing_empty_and_trimmed` (missing path → `None`; file with `"  \n"` → `None`; file with `" text \n"` → `Some("text")`; bytes `[0xff,0xfe]` → `None`) using `tempfile` or `std::env::temp_dir()` paths; in `model.rs`: `old_coverage_json_without_pplx_deserializes` (`{"paxmod":"Ran","jev":"Ran","ocr":"Skipped"}` → ok, `pplx == Cov::Skipped`).
 - [ ] **Step 2: Run** `cargo test --lib config::tests model::tests` — Expected: FAIL.
 - [ ] **Step 3: Implement** the interfaces. `main.rs`: build one `PpqClient` per model (`env.jev_model`, `env.pplx_model`) with `load_policy(&env.policy_file)` (log a warning when `None`), replace the `TYPESAFE_API_KEY` placeholder warning with `PPQ_API_KEY`. `replay.rs`, `tests/simulations.rs` (wiremock paths now `/decisions`; add a third mock for Perplexity), `tests/live_*.rs` (use `ppq_key`/`ppq_base`, `#[ignore]` kept): mechanical updates so everything compiles. `pipeline.rs` test harness: add `harness_full(cfg, pax, pplx, jev, enforce, roll, sink)`; existing `harness(...)` calls it with `FakeJev::clean()` for Perplexity; `H` gains `pplx: Arc<FakeJev>`. Pipeline logic is not changed here.
 - [ ] **Step 4: `.env.example`:** replace the Typesafe block with `PPQ_API_KEY`, `PPQ_BASE_URL=https://api.ppq.ai/v1`, `JEV_MODEL=typesafe/jev-1.13`, `JEV_DAILY_CAP=2000`, `PPLX_MODEL=perplexity/pplx-decider-v1.2`, `PPLX_DAILY_CAP=2000`, `POLICY_FILE=policy.txt`. `config.toml` `[defaults.fusion]`: `w_pplx = 1.0`, `w_jev = 1.0`, and replace the comment block with the new rule (acting source = Paxmod, else Perplexity, else Jev; everything else report-only, capped below the action rungs).
@@ -107,21 +111,30 @@ Independent of all code tasks; run first so the owner has the numbers early. Not
 
 ---
 
-### Task 4: Fusion — acting source and report-only cap
+### Task 4: Fusion — acting source, report-only cap, corroboration gate (hotfix; run right after Task 1)
+
+Releasable on its own: the pipeline passes `pplx: None` until Task 5, so this fixes incidents #77/#78 with only Paxmod + Jev + local rules.
 
 **Files:**
-- Modify: `src/fusion.rs`, `src/policy.rs`
-- Test: unit tests in both files; update existing `fusion.rs` tests whose expectations assumed `w_jev` entered the noisy-or
+- Modify: `src/fusion.rs`, `src/policy.rs`, `src/model.rs` (`Verdict`), `src/config.rs` (`FusionConfig.w_pplx`), `src/pipeline.rs` (`fuse` call site; pipeline tests)
+- Test: unit tests in fusion/policy/config; update existing `fusion.rs` and `policy.rs` tests whose expectations assumed `w_jev` entered the noisy-or or that construct `Verdict { .. }` directly (grep `Verdict {`)
 
 **Interfaces:**
 - Produces:
+  - `FusionConfig.w_pplx: f64` (default 0.9), added next to every existing `w_jev` occurrence in `config.rs` (default impl, `/guard config` key lists and setters ~lines 360, 402, 418, 535, display ~587). Do not edit `config.toml` in this task.
+  - `Verdict.corroborated: bool` with `#[serde(default)]`
+  - `policy::decide` returns at most `Action::Flag` when `!v.corroborated` (and the flag rung is reached); behavior when `corroborated` is unchanged
   - `Inputs.pplx: Option<&'a JevResult>`
   - `pub fn fuse(inp: &Inputs, cfg: &FusionConfig, clean_below: f64, report_cap: f64) -> Verdict`
   - `pub const REPORT_CAP_MAX: f64 = 0.45;` and `pub fn report_cap(tier: Tier, l: &LadderConfig) -> f64` in `policy.rs`: `min(REPORT_CAP_MAX, min(delete, timeout, kick, ban of that tier's rungs that are Some) - 0.01)`; `REPORT_CAP_MAX` if the tier has no rungs set; `Trusted` → `REPORT_CAP_MAX`
   - Evidence: `pplx:class=… dm=… crypto=… evasion=… bot=… policy=…` line (same format as the `jev:` line, plus `policy=` when present); the label may still use any model's `scam_phishing`/`nsfw_lure` class
-- Consumes: `FusionConfig.w_pplx`, `JevResult.policy_block` (Tasks 2–3).
+- Consumes: nothing from other tasks (`JevResult.policy_block` from Task 2 is not needed here).
 
-- [ ] **Step 1: Write failing tests** (all with `FusionConfig::default()`, `clean_below = 0.4`, `report_cap = 0.45` unless stated; `spam_model()` = `JevResult { class: "spam", class_probs: {"spam": 1.0, "legitimate": 0.0}, ..Default::default() }`):
+- [ ] **Step 1: Write failing tests.** Gate tests first:
+  - In `fusion.rs`: `corroborated_when_another_source_agrees`: Paxmod Spam 1.0 + Jev spam → `corroborated`; Paxmod Spam 1.0 + Jev legitimate (`legitimate` 1.0) → not corroborated; Paxmod 1.0 + local score 0.6 → corroborated; Paxmod 1.0 + local score 0.35 → not corroborated; local alone (no model) → corroborated (outage behavior unchanged); `FusionConfig::default().w_pplx == 0.9`; the uncorroborated verdict's evidence contains `"note: no second source agreed; flag only"`.
+  - In `policy.rs`: `uncorroborated_never_exceeds_flag`: `verdict(0.99, Label::Spam, 1)` with `corroborated = false` in every tier → `Action::Flag`; with `corroborated = true` → unchanged expectations (existing tests set it true).
+  - In `pipeline.rs` (enforce mode, quarantine user, `roll = 0.99`): `incident_77_replay_flags_only`: `FakePax::spam_flagged(1.0, "tagging a user to initiate contact")`, `FakeJev::clean()`, text `"its working or not. <@1308810777939148800>"` → `h.sink.empty()`, incident `taken == "flag"`; `incident_78_replay_is_not_actioned`: `FakePax::spam(0.0)`, Jev `promo_solicitation` 0.97 (`class_probs {"promo_solicitation": 0.97, "legitimate": 0.01}`, `class_confidence 0.96`), message with a link in a first message (so `first_message_link` fires) → `h.sink.empty()`; `paxmod_flag_with_jev_agreement_still_acts`: `FakePax::spam_flagged(1.0, "x")` + `FakeJev::spam()` → sink has `delete` and `timeout`.
+  - Then the fusion tests (all with `FusionConfig::default()`, `clean_below = 0.4`, `report_cap = 0.45` unless stated; `spam_model()` = `JevResult { class: "spam", class_probs: {"spam": 1.0, "legitimate": 0.0}, ..Default::default() }`):
   - `paxmod_acts_models_report_only`: Paxmod Spam 0.1 + `spam_model()` for both pplx and jev → `score == 0.45` (±1e-9), `label != Clean`, `agreeing_sources == 0`.
   - `local_plus_report_only_cannot_cross_delete`: local score 0.6 + Paxmod 0.0 + both models spam → `score < 0.5`.
   - `pplx_acts_when_paxmod_missing`: pplx spam, jev spam → `score == 0.9`; pplx spam, jev clean → `0.9`; pplx clean (`legitimate` 1.0), jev spam → `score == 0.45`.
@@ -129,12 +142,13 @@ Independent of all code tasks; run first so the owner has the numbers early. Not
   - `report_cap_parameter_is_respected`: Paxmod 0.0, models spam, `report_cap = 0.2` → `score == 0.2`.
   - `local_alone_stands_alone`: unchanged existing behavior (weight 1.0 when no provider source is present).
   - In `policy.rs`: `report_cap_follows_lowest_rung`: ladder with quarantine `delete = 0.50, timeout = 0.50` → `0.45`; with `delete = 0.40` → `0.39`; tier with no rungs set → `0.45`.
-- [ ] **Step 2: Run** `cargo test --lib fusion::tests policy::tests` — Expected: FAIL.
-- [ ] **Step 3: Implement.** Acting = first `Some` of paxmod, pplx, jev. Acting source: `weight * risk` into the spam and abuse term lists (existing Paxmod/Jev code per source), counts toward `agreeing` at risk >= 0.5, and Paxmod keeps its category/reason/ban evidence. Local term uses `w_local` when any provider source is present (even report-only ones, since `agreeing`/outage semantics key off *responses*), else 1.0. Report-only sources: evidence line only, and `spam_report = min(max(their spam risks), report_cap)`, `abuse_report` likewise; final `spam_score = max(noisy_or(spam_terms), spam_report)`, same for abuse. Update the module doc comment.
+- [ ] **Step 2: Run** `cargo test --lib fusion::tests policy::tests pipeline::tests::incident_7` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Compute `corroborated` in `fuse` per the Global Constraints definition, store it on `Verdict`, add the evidence note when false, and gate in `decide`. Acting = first `Some` of paxmod, pplx, jev. Acting source: `weight * risk` into the spam and abuse term lists (existing Paxmod/Jev code per source), counts toward `agreeing` at risk >= 0.5, and Paxmod keeps its category/reason/ban evidence. Local term uses `w_local` when any provider source is present (even report-only ones, since `agreeing`/outage semantics key off *responses*), else 1.0. Report-only sources: evidence line only, and `spam_report = min(max(their spam risks), report_cap)`, `abuse_report` likewise; final `spam_score = max(noisy_or(spam_terms), spam_report)`, same for abuse. Update the module doc comment.
   - Label check (spec asked the builder to confirm): `policy::decide` uses the label only for `Clean` (no action) and for `Spam | Scam` gating kick/ban, which also needs `agreeing_sources >= 2`; since report-only models no longer count toward `agreeing_sources`, a label taken from their class cannot escalate any action. Add `report_only_scam_class_cannot_enable_kick_or_ban` in `policy.rs` or `fusion.rs`: Paxmod 0.0, both models `scam_phishing` spam 1.0 → `agreeing_sources == 0` and `decide(...)` with kick/ban enabled returns no action above `Flag`.
 - [ ] **Step 4: Fix existing tests** in `fusion.rs` that assumed the old multi-source noisy-or (`sources_combine_noisy_or` etc.): rewrite expectations to the new rule rather than loosening them. Update the call sites of `fuse` (`pipeline.rs`: pass `report_cap(tier, &gc.ladder)`; `pplx: None` for now).
-- [ ] **Step 5: Run** `cargo test --lib` — Expected: PASS.
-- [ ] **Step 6: Commit** `git commit -m "feat: fusion acting-source order with report-only cap"`
+- [ ] **Step 5: Run** `scripts/check.sh` — Expected: all gates pass.
+- [ ] **Step 6: Commit** `git commit -m "fix: corroboration gate and report-only cap; models can no longer tip Paxmod over the action line"`
+- [ ] **Step 7: Hotfix release note for the owner:** this task can be deployed alone (sync `src/`, rebuild, restart; no config or `.env` changes needed). With the server's current `w_jev = 0.45`, Jev cannot act on its own, which is the conservative behavior wanted.
 
 ---
 
@@ -200,6 +214,25 @@ Independent of all code tasks; run first so the owner has the numbers early. Not
 - [ ] **Step 2: Live smoke test (needs a ppq key in the shell env, not in the repo):** `PPQ_API_KEY=… cargo test --test live_api -- --ignored --nocapture live_jev` — Expected: both models return parseable results for a scam and a benign string; cost shown in cents. If no key is available to the agent, ask the owner to run it.
 - [ ] **Step 3: grep check:** `grep -rn -i "typesafe" --include="*.rs" --include="*.toml" --include="*.example" --include="*.md" . --exclude-dir=target --exclude-dir=.git --exclude-dir=superpowers` shows no matches except model names (`typesafe/jev-…`).
 - [ ] **Step 4: Commit** `git commit -m "docs: live-test env vars, implementation note"` and report to the owner: task commits, test counts, the Task 1 benchmark numbers.
+
+### Task 8: Policy mention carve-out (outside the repo; the owner pastes into the Paxmod console)
+
+Fixes the Paxmod side of incident #77. Independent of the code tasks; `repo/policy.txt` (Task 3) is only updated at the end if it exists.
+
+**Files:**
+- Create: `decision_bench/data/mentions.jsonl` (same row format as `data/dataset.jsonl`: `id,text,label,group,category,kind,difficulty`), `decision_bench/prompts/cand_mention_<n>.txt`
+- Modify: `decision_bench/paxmod_bench.py` (add `--data` and `--out` arguments, defaults unchanged so existing runs behave the same)
+
+**Interfaces:**
+- Produces: a candidate policy ≤ 800 characters that Paxmod does not flag on ordinary mentions, plus before/after numbers.
+
+- [ ] **Step 1: Build the mention set.** At least 60 clean rows (ordinary chat with raw `<@1308810777939148800>`-style mentions leading, trailing and mid-sentence: thanks, replies, "ask <@id>", "its working or not. <@id>", mod pings, "good morning <@id>") and at least 25 scam rows that use mentions (`FREE SUPPORT SERVER 2026 (NO SCAM) DM 👉 <@id>`, "need help? DM <@id>", obfuscated invite + mention ping, "add me on telegram @handle <@id>", profile-link redirects with a ping). Start from the lists in `decision_bench/mention_probe.py`; write the rest by hand, varied in tone and length; no template swaps.
+- [ ] **Step 2: Baseline on real Paxmod with the current policy:** `python3 paxmod_bench.py --data data/mentions.jsonl --out results/paxmod_mentions_base.jsonl`; record false-block count on clean rows and misses on scam rows (the 2/18 from the probe is the expected ballpark).
+- [ ] **Step 3: Write 3–5 candidates** as rewrites of `prompts/cand_rw_4.txt` that add a short carve-out (ordinary `<@id>` mentions, replies and pings in conversation are not contact pushes; "DM me", "DM <@id>", "add me", and profile/handle pointers still are), staying ≤ 800 characters (check with `len(open(p,encoding="utf-8").read().strip())`). Screen them on the proxy panel with `prompt_opt.py` (`val`) plus the mention set, keep the best one or two.
+- [ ] **Step 4: Owner pastes the best candidate** into the Paxmod console. Then run, against real Paxmod: the mention set, `data/val.jsonl`, and the full `data/dataset.jsonl`. Acceptance: at most 1 false block in the clean mention rows, no scam row from the mention set newly missed, and the main dataset still at 0 false blocks with scams caught ≥ 99%. If it fails, the old policy is in `decision_bench/paxmod_prompt_candidate.txt` (restore it) and the next candidate is tried.
+- [ ] **Step 5: If it passes,** copy the text to `repo/policy.txt` (when Task 3 has landed) and `decision_bench/paxmod_prompt_candidate.txt`; commit `policy.txt` only.
+
+---
 
 ## Not part of this plan (owner go-ahead required)
 
