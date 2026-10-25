@@ -199,6 +199,10 @@ pub struct Verdict {
     pub abuse_score: f64,
     pub label: Label,
     pub agreeing_sources: u8,
+    /// Some source other than the acting one also scored spam/abuse >= 0.5 (or no model
+    /// responded and local rules stand alone). Uncorroborated verdicts never go past Flag.
+    #[serde(default)]
+    pub corroborated: bool,
     pub coverage: Coverage,
     pub evidence: Vec<String>,
 }

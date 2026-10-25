@@ -85,11 +85,12 @@ pub struct FusionConfig {
     pub w_local: f64,
     pub w_paxmod: f64,
     pub w_jev: f64,
+    pub w_pplx: f64,
 }
 
 impl Default for FusionConfig {
     fn default() -> Self {
-        Self { w_local: 0.6, w_paxmod: 0.9, w_jev: 0.9 }
+        Self { w_local: 0.6, w_paxmod: 0.9, w_jev: 0.9, w_pplx: 0.9 }
     }
 }
 
@@ -358,6 +359,7 @@ fn validate_guild(g: &GuildConfig) -> anyhow::Result<()> {
         ("fusion.w_local", g.fusion.w_local),
         ("fusion.w_paxmod", g.fusion.w_paxmod),
         ("fusion.w_jev", g.fusion.w_jev),
+        ("fusion.w_pplx", g.fusion.w_pplx),
     ] {
         anyhow::ensure!((0.0..=1.0).contains(&v), "{name} must be between 0 and 1");
     }
@@ -400,6 +402,7 @@ const FLOAT_KEYS: &[&str] = &[
     "fusion.w_local",
     "fusion.w_paxmod",
     "fusion.w_jev",
+    "fusion.w_pplx",
 ];
 
 /// Keys `/guard config set` and `reset` accept (`log_channel_id` is handled
@@ -416,6 +419,7 @@ pub const OVERRIDE_KEYS: &[&str] = &[
     "fusion.w_local",
     "fusion.w_paxmod",
     "fusion.w_jev",
+    "fusion.w_pplx",
 ];
 
 fn parse_doc(doc: Option<&str>) -> anyhow::Result<toml::Table> {
@@ -533,6 +537,7 @@ pub fn describe_key(g: &GuildConfig, key: &str) -> String {
         "fusion.w_local" => format!("{:.2}", g.fusion.w_local),
         "fusion.w_paxmod" => format!("{:.2}", g.fusion.w_paxmod),
         "fusion.w_jev" => format!("{:.2}", g.fusion.w_jev),
+        "fusion.w_pplx" => format!("{:.2}", g.fusion.w_pplx),
         _ => key
             .strip_prefix("ladder.")
             .and_then(|r| r.split_once('.'))
@@ -584,7 +589,10 @@ pub fn config_summary(mode: Mode, log_channel: Option<u64>, has_override: bool, 
             "Plan: local hit {:.2}, fresh sample {:.2}, established sample {:.2}",
             g.plan.local_hit_threshold, g.plan.fresh_sample_rate, g.plan.established_sample_rate
         ),
-        format!("Fusion weights: local {:.2}, paxmod {:.2}, jev {:.2}", g.fusion.w_local, g.fusion.w_paxmod, g.fusion.w_jev),
+        format!(
+            "Fusion weights: local {:.2}, paxmod {:.2}, pplx {:.2}, jev {:.2}",
+            g.fusion.w_local, g.fusion.w_paxmod, g.fusion.w_pplx, g.fusion.w_jev
+        ),
     ]
     .join("\n")
 }

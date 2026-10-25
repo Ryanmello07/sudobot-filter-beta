@@ -8,7 +8,7 @@ use crate::guarded::{guarded, GuardErr, Guarded};
 use crate::imaging;
 use crate::model::*;
 use crate::normalize::{contains_url, hash_bytes, hash_text, normalize};
-use crate::policy::{decide, flag_threshold};
+use crate::policy::{decide, flag_threshold, report_cap};
 use crate::ports::*;
 use crate::providers::jev::JevState;
 use crate::risk::{compute_tier, detection_plan, graduated, ocr_eligible, Plan, TierHints};
@@ -328,9 +328,10 @@ impl Pipeline {
 
         // ---- fuse + decide ----
         let verdict = fuse(
-            &Inputs { local: Some(&local), paxmod: pax.as_ref(), jev: jev.as_ref(), coverage },
+            &Inputs { local: Some(&local), paxmod: pax.as_ref(), pplx: None, jev: jev.as_ref(), coverage },
             &gc.fusion,
             flag_threshold(tier, &gc.ladder),
+            report_cap(tier, &gc.ladder),
         );
         let planned = decide(tier, &verdict, &history, &gc.ladder);
         tracing::info!(
@@ -1064,7 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn quarantine_spam_is_deleted_timed_out_and_swept_in_enforce() {
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
         let now = Utc::now();
         // two earlier messages from the same spammer
         h.p.store().add_recent(1, 7, 50, 901, now - Duration::minutes(2)).await.unwrap();
@@ -1080,6 +1081,62 @@ mod tests {
         assert_eq!(h.log.incidents.lock().unwrap().len(), 1);
         // strike recorded, so the next message is escalated
         assert_eq!(h.p.store().history(1, 7, now).await.unwrap().active_strikes, 1);
+    }
+
+    #[tokio::test]
+    async fn incident_77_replay_flags_only() {
+        let h = harness(FakePax::spam_flagged(1.0, "tagging a user to initiate contact"), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(77, 7, "its working or not. <@1308810777939148800>", new_user(7)), Utc::now()).await;
+        assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+        assert_eq!(o.planned, Action::Flag);
+        assert_eq!(o.taken, "flag");
+        let v = o.verdict.unwrap();
+        assert!(!v.corroborated);
+        assert!(v.evidence.iter().any(|e| e == "note: no second source agreed; flag only"));
+        let row = h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap();
+        assert_eq!(row.action_taken, "flag");
+    }
+
+    #[tokio::test]
+    async fn incident_78_replay_is_not_actioned() {
+        let promo = JevResult {
+            class: "promo_solicitation".into(),
+            class_probs: [("promo_solicitation".to_string(), 0.97), ("legitimate".to_string(), 0.01)].into(),
+            class_confidence: 0.96,
+            ..Default::default()
+        };
+        let h = harness(FakePax::spam(0.0), FakeJev::new(Ok(promo)), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(78, 7, "i would get the 4070, see https://example.com/review for benchmarks", new_user(7)), Utc::now()).await;
+        let v = o.verdict.as_ref().unwrap();
+        assert!(v.evidence.iter().any(|e| e.starts_with("rule:first_message_link")), "{:?}", v.evidence);
+        assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+        assert!(o.planned <= Action::Flag, "{:?} score {}", o.planned, v.score);
+        assert!(v.score < 0.5, "{}", v.score);
+    }
+
+    #[tokio::test]
+    async fn paxmod_alone_is_flag_only_but_a_local_rule_corroborates() {
+        // Paxmod at full confidence, Jev clean, no local rule: flag only, nothing acted.
+        let h = harness(FakePax::spam(1.0), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(1, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
+        assert_eq!((o.planned, o.taken.as_str()), (Action::Flag, "flag"));
+        assert!(h.sink.empty());
+        // A strong local rule (mass mention, 0.7) is a second source.
+        let h = harness(FakePax::spam(1.0), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let mut m = msg(2, 7, "hi", new_user(7));
+        m.distinct_mentions = 12;
+        let o = h.p.handle(m, Utc::now()).await;
+        assert!(o.verdict.as_ref().unwrap().corroborated);
+        assert!(o.planned > Action::Flag, "{:?}", o.planned);
+        assert!(h.sink.has("delete 50 2") || h.sink.has("ban 7") || h.sink.has("kick 7"), "log: {:?}", h.sink.log.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paxmod_flag_with_jev_agreement_still_acts() {
+        let h = harness(FakePax::spam_flagged(1.0, "x"), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(1, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
+        assert!(o.verdict.as_ref().unwrap().corroborated);
+        assert!(h.sink.has("delete 50 1") && h.sink.has("timeout 7 60"), "log: {:?}", h.sink.log.lock().unwrap());
     }
 
     #[test]
@@ -1102,12 +1159,12 @@ mod tests {
 
     #[tokio::test]
     async fn auto_timeout_uses_paxmod_reason_in_audit_log() {
-        let h = harness(FakePax::spam_flagged(0.8, "crypto drainer tactic"), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let h = harness(FakePax::spam_flagged(0.8, "crypto drainer tactic"), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
         let o = h.p.handle(msg(1000, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert_eq!(o.taken, "delete+timeout");
         assert!(h.sink.has("timeout 7 60 | Automated Temporary Mute: crypto drainer tactic"));
 
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
         let o = h.p.handle(msg(1001, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert_eq!(o.taken, "delete+timeout");
         let v = o.verdict.as_ref().unwrap();
@@ -1117,7 +1174,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_safe_lifts_bot_timeout() {
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
         let o = h.p.handle(msg(1000, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert_eq!(o.taken, "delete+timeout");
         let row = h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap();
@@ -1167,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_safe_lifts_timeout_when_delete_failed_but_timeout_landed() {
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink { fail_delete: true, ..Default::default() }).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), true, 0.99, FakeSink { fail_delete: true, ..Default::default() }).await;
         let o = h.p.handle(msg(1000, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert_eq!(o.taken, "failed");
         let row = h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap();
@@ -1197,7 +1254,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_safe_reports_failed_unmute() {
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink { fail_untimeout: true, ..Default::default() }).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), true, 0.99, FakeSink { fail_untimeout: true, ..Default::default() }).await;
         let o = h.p.handle(msg(1000, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert_eq!(o.taken, "delete+timeout");
         let row = h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap();
@@ -1209,7 +1266,7 @@ mod tests {
 
     #[tokio::test]
     async fn observe_mode_performs_no_discord_action() {
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), false, 0.99, FakeSink::default()).await;
         let o = h.p.handle(msg(1, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert_eq!(o.planned, Action::DeleteTimeout);
         assert_eq!(o.taken, "would-have");
@@ -1231,7 +1288,7 @@ mod tests {
 
     #[tokio::test]
     async fn hierarchy_refusal_is_recorded_not_retried() {
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink { refuse: true, ..Default::default() }).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), true, 0.99, FakeSink { refuse: true, ..Default::default() }).await;
         let o = h.p.handle(msg(1, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert_eq!(o.taken, "refused");
         assert!(h.sink.empty());
@@ -1316,7 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_message_twice_is_actioned_once() {
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
         let m = msg(5, 7, "buy cheap stuff now", new_user(7));
         h.p.handle(m.clone(), Utc::now()).await;
         let mut edit = m;
@@ -1500,7 +1557,7 @@ mod tests {
     // no second mod-log embed).
     #[tokio::test]
     async fn m5_reprocessing_does_not_overwrite_action_taken() {
-        let h = harness(FakePax::spam(0.8), FakeJev::clean(), true, 0.99, FakeSink::default()).await;
+        let h = harness(FakePax::spam(0.8), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
         let m = msg(5, 7, "buy cheap stuff now", new_user(7));
         let first = h.p.handle(m.clone(), Utc::now()).await;
         assert_eq!(first.taken, "delete+timeout");

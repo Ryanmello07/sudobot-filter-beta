@@ -17,10 +17,26 @@ pub fn flag_threshold(tier: Tier, l: &LadderConfig) -> f64 {
     rungs(tier, l).and_then(|r| r.flag.or(r.delete)).unwrap_or(0.5)
 }
 
+/// Highest score report-only models may add on their own; always below the delete line.
+pub const REPORT_CAP_MAX: f64 = 0.45;
+
+/// Cap on the score report-only models can contribute for this tier: below the lowest
+/// action rung (delete, timeout, kick, ban) that is set, so a guild override with a low
+/// delete threshold cannot let them act.
+pub fn report_cap(tier: Tier, l: &LadderConfig) -> f64 {
+    let Some(r) = rungs(tier, l) else { return REPORT_CAP_MAX };
+    [r.delete, r.timeout, r.kick, r.ban].into_iter().flatten().fold(REPORT_CAP_MAX, |cap, t| cap.min(t - 0.01))
+}
+
 pub fn decide(tier: Tier, v: &Verdict, h: &MemberHistory, l: &LadderConfig) -> Action {
     let Some(r) = rungs(tier, l) else { return Action::None };
     if v.label == Label::Clean {
         return Action::None;
+    }
+    // Owner priority: a wrong action on a legitimate member is worse than a missed spam.
+    // Without a second source agreeing, the most we do is flag for moderators.
+    if !v.corroborated {
+        return if v.score >= r.flag.unwrap_or(f64::INFINITY) { Action::Flag } else { Action::None };
     }
     let reach = |t: Option<f64>| t.is_some_and(|t| v.score >= t);
     let multi = v.agreeing_sources >= 2 || (l.repeat_offender_single_source && h.active_strikes > 0);
@@ -55,8 +71,45 @@ mod tests {
             abuse_score: 0.0,
             label,
             agreeing_sources: agree,
+            corroborated: true,
             coverage: Coverage::default(),
             evidence: vec![],
+        }
+    }
+
+    #[test]
+    fn uncorroborated_never_exceeds_flag() {
+        let l = LadderConfig::default();
+        for tier in [Tier::Quarantine, Tier::Fresh, Tier::Established] {
+            let mut v = verdict(0.99, Label::Spam, 1);
+            v.corroborated = false;
+            assert_eq!(decide(tier, &v, &MemberHistory::default(), &l), Action::Flag, "{tier:?}");
+            // even with kick/ban "multi source" satisfied
+            let mut v = verdict(0.99, Label::Spam, 2);
+            v.corroborated = false;
+            assert_eq!(decide(tier, &v, &MemberHistory::default(), &l), Action::Flag, "{tier:?}");
+            v.corroborated = true;
+            assert!(decide(tier, &v, &MemberHistory::default(), &l) > Action::Flag, "{tier:?}");
+        }
+        // below the flag rung stays None
+        let mut v = verdict(0.3, Label::Spam, 1);
+        v.corroborated = false;
+        assert_eq!(d(Tier::Quarantine, &v), Action::None);
+    }
+
+    #[test]
+    fn report_cap_follows_lowest_rung() {
+        let mut l = LadderConfig { quarantine: Rungs { flag: Some(0.3), delete: Some(0.50), timeout: Some(0.50), kick: None, ban: None }, ..Default::default() };
+        assert!((report_cap(Tier::Quarantine, &l) - 0.45).abs() < 1e-9);
+        l.quarantine.delete = Some(0.40);
+        assert!((report_cap(Tier::Quarantine, &l) - 0.39).abs() < 1e-9);
+        l.quarantine = Rungs { flag: Some(0.3), delete: None, timeout: None, kick: None, ban: None };
+        assert_eq!(report_cap(Tier::Quarantine, &l), REPORT_CAP_MAX);
+        assert_eq!(report_cap(Tier::Trusted, &l), REPORT_CAP_MAX);
+        // defaults: every tier's lowest action rung is above 0.46
+        let d = LadderConfig::default();
+        for t in [Tier::Quarantine, Tier::Fresh, Tier::Established] {
+            assert_eq!(report_cap(t, &d), REPORT_CAP_MAX, "{t:?}");
         }
     }
 

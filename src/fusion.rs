@@ -1,4 +1,12 @@
-//! Fuse local, Paxmod and Jev results into one verdict.
+//! Fuse local, Paxmod, Perplexity and Jev results into one verdict.
+//!
+//! One model is the *acting source*: Paxmod if it responded, else Perplexity, else
+//! Jev, else local rules stand alone. The acting source and the local rules combine
+//! through noisy-or (acting source at its configured weight). Every other model is
+//! report-only: its evidence is shown and it can lift the score to at most
+//! `report_cap` (below the delete rung), but never combines with other terms.
+//! `Verdict.corroborated` records whether a second source agreed (risk >= 0.5, local
+//! counts at score >= 0.5); `policy::decide` never goes past a flag without it.
 
 use crate::config::FusionConfig;
 use crate::model::*;
@@ -7,6 +15,7 @@ use crate::model::*;
 pub struct Inputs<'a> {
     pub local: Option<&'a LocalResult>,
     pub paxmod: Option<&'a PaxmodResult>,
+    pub pplx: Option<&'a JevResult>,
     pub jev: Option<&'a JevResult>,
     pub coverage: Coverage,
 }
@@ -54,19 +63,44 @@ pub fn jev_risks(j: &JevResult) -> (f64, f64) {
     (spam, abuse)
 }
 
-/// `clean_below`: scores under this are labeled Clean.
-pub fn fuse(inp: &Inputs, cfg: &FusionConfig, clean_below: f64) -> Verdict {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Acting {
+    Paxmod,
+    Pplx,
+    Jev,
+    None,
+}
+
+fn model_line(name: &str, j: &JevResult) -> String {
+    format!("{name}:class={} dm={:.2} crypto={:.2} evasion={:.2} bot={:.2}", j.class, j.dm_lure, j.crypto_giveaway, j.evasion, j.bot_like)
+}
+
+/// `clean_below`: scores under this are labeled Clean. `report_cap`: the most that
+/// report-only models can contribute (see `policy::report_cap`).
+pub fn fuse(inp: &Inputs, cfg: &FusionConfig, clean_below: f64, report_cap: f64) -> Verdict {
     let mut spam_terms = vec![];
     let mut abuse_terms = vec![];
     let mut agreeing = 0u8;
     let mut evidence = vec![];
 
+    let pax_r = inp.paxmod.map(paxmod_risks);
+    let pplx_r = inp.pplx.map(jev_risks);
+    let jev_r = inp.jev.map(jev_risks);
+    let acting = if pax_r.is_some() {
+        Acting::Paxmod
+    } else if pplx_r.is_some() {
+        Acting::Pplx
+    } else if jev_r.is_some() {
+        Acting::Jev
+    } else {
+        Acting::None
+    };
+
     if let Some(l) = inp.local {
-        // When no other source contributed, the local score stands on its own:
-        // applying w_local would cap local-only verdicts at 0.6, below the quarantine
-        // delete threshold — even flagging would be unreachable during a provider
-        // outage. Multi-source fusion is unchanged (the weight still applies then).
-        let w = if inp.paxmod.is_none() && inp.jev.is_none() { 1.0 } else { cfg.w_local };
+        // When no provider responded, the local score stands on its own: applying
+        // w_local would cap local-only verdicts at 0.6, below the quarantine delete
+        // threshold, and even flagging would be unreachable during a provider outage.
+        let w = if acting == Acting::None { 1.0 } else { cfg.w_local };
         spam_terms.push(w * l.score);
         if l.score >= 0.5 {
             agreeing += 1;
@@ -75,13 +109,28 @@ pub fn fuse(inp: &Inputs, cfg: &FusionConfig, clean_below: f64) -> Verdict {
             evidence.push(format!("rule:{} ({:.2})", s.name, s.weight));
         }
     }
-    if let Some(p) = inp.paxmod {
-        let (s, a) = paxmod_risks(p);
-        spam_terms.push(cfg.w_paxmod * s);
-        abuse_terms.push(cfg.w_paxmod * a);
-        if s.max(a) >= 0.5 {
-            agreeing += 1;
+    let mut corroborated = acting == Acting::None || inp.local.is_some_and(|l| l.score >= 0.5);
+
+    // Only the acting source enters the noisy-or; the others are report-only and are
+    // folded in below as a single capped term that cannot combine with anything.
+    let (mut spam_report, mut abuse_report) = (0.0f64, 0.0f64);
+    for (who, risks, w) in [(Acting::Paxmod, pax_r, cfg.w_paxmod), (Acting::Pplx, pplx_r, cfg.w_pplx), (Acting::Jev, jev_r, cfg.w_jev)] {
+        let Some((s, a)) = risks else { continue };
+        let hit = s.max(a) >= 0.5;
+        if who == acting {
+            spam_terms.push(w * s);
+            abuse_terms.push(w * a);
+            if hit {
+                agreeing += 1;
+            }
+        } else {
+            spam_report = spam_report.max(s);
+            abuse_report = abuse_report.max(a);
+            corroborated |= hit;
         }
+    }
+
+    if let Some(p) = inp.paxmod {
         let mut top: Vec<_> = p.categories.iter().filter(|(_, v)| **v >= 0.3).collect();
         top.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
         for (k, v) in top.into_iter().take(4) {
@@ -94,32 +143,31 @@ pub fn fuse(inp: &Inputs, cfg: &FusionConfig, clean_below: f64) -> Verdict {
             evidence.push(format!("paxmod reason: {}", r.chars().take(160).collect::<String>()));
         }
     }
+    if let Some(j) = inp.pplx {
+        evidence.push(model_line("pplx", j));
+    }
     if let Some(j) = inp.jev {
-        let (s, a) = jev_risks(j);
-        spam_terms.push(cfg.w_jev * s);
-        abuse_terms.push(cfg.w_jev * a);
-        if s.max(a) >= 0.5 {
-            agreeing += 1;
-        }
-        evidence.push(format!(
-            "jev:class={} dm={:.2} crypto={:.2} evasion={:.2} bot={:.2}",
-            j.class, j.dm_lure, j.crypto_giveaway, j.evasion, j.bot_like
-        ));
+        evidence.push(model_line("jev", j));
+    }
+    if !corroborated {
+        evidence.push("note: no second source agreed; flag only".into());
     }
 
-    let spam_score = noisy_or(spam_terms.into_iter());
-    let abuse_score = noisy_or(abuse_terms.into_iter());
+    let spam_score = noisy_or(spam_terms.into_iter()).max(spam_report.min(report_cap));
+    let abuse_score = noisy_or(abuse_terms.into_iter()).max(abuse_report.min(report_cap));
     let score = spam_score.max(abuse_score);
+    // Display only: policy::decide never reads the label except to skip Clean and to
+    // gate kick/ban, which also needs agreeing_sources >= 2 (acting source + local).
     let label = if score < clean_below {
         Label::Clean
     } else if abuse_score > spam_score {
         Label::Abuse
-    } else if inp.jev.is_some_and(|j| j.class == "scam_phishing" || j.class == "nsfw_lure") {
+    } else if [inp.pplx, inp.jev].into_iter().flatten().any(|j| j.class == "scam_phishing" || j.class == "nsfw_lure") {
         Label::Scam
     } else {
         Label::Spam
     };
-    Verdict { score, spam_score, abuse_score, label, agreeing_sources: agreeing, coverage: inp.coverage, evidence }
+    Verdict { score, spam_score, abuse_score, label, agreeing_sources: agreeing, corroborated, coverage: inp.coverage, evidence }
 }
 
 #[cfg(test)]
@@ -143,9 +191,31 @@ mod tests {
         FusionConfig::default()
     }
 
+    const CAP: f64 = 0.45;
+
+    fn fz(inp: &Inputs) -> Verdict {
+        fuse(inp, &cfg(), 0.4, CAP)
+    }
+
+    fn spam_model() -> JevResult {
+        JevResult {
+            class: "spam".into(),
+            class_probs: [("spam".to_string(), 1.0), ("legitimate".to_string(), 0.0)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn clean_model() -> JevResult {
+        JevResult { class: "legitimate".into(), class_probs: [("legitimate".to_string(), 1.0)].into_iter().collect(), ..Default::default() }
+    }
+
+    fn local(score: f64) -> LocalResult {
+        LocalResult::from_signals(vec![Signal { name: "x".into(), weight: score }])
+    }
+
     #[test]
     fn nothing_is_clean() {
-        let v = fuse(&Inputs::default(), &cfg(), 0.4);
+        let v = fz(&Inputs::default());
         assert_eq!(v.score, 0.0);
         assert_eq!(v.label, Label::Clean);
         assert_eq!(v.agreeing_sources, 0);
@@ -154,22 +224,130 @@ mod tests {
     #[test]
     fn single_source_is_capped_by_weight() {
         let p = pax(&[("Spam", 1.0)]);
-        let v = fuse(&Inputs { paxmod: Some(&p), ..Default::default() }, &cfg(), 0.4);
+        let v = fz(&Inputs { paxmod: Some(&p), ..Default::default() });
         assert!((v.score - 0.9).abs() < 1e-9);
         assert_eq!(v.agreeing_sources, 1);
         assert_eq!(v.label, Label::Spam);
     }
 
     #[test]
-    fn sources_combine_noisy_or() {
+    fn acting_source_and_local_combine_noisy_or_models_stay_report_only() {
         let p = pax(&[("Spam", 0.8)]);
         let j = jev("spam", 0.1);
         let l = LocalResult::from_signals(vec![Signal { name: "duplicate".into(), weight: 0.6 }]);
-        let v = fuse(&Inputs { local: Some(&l), paxmod: Some(&p), jev: Some(&j), ..Default::default() }, &cfg(), 0.4);
-        // 1 - (1-0.36)(1-0.72)(1-0.81)
-        let expect = 1.0 - (1.0 - 0.36) * (1.0 - 0.72) * (1.0 - 0.81);
+        let v = fz(&Inputs { local: Some(&l), paxmod: Some(&p), jev: Some(&j), ..Default::default() });
+        // Jev is report-only: only local (0.36) and Paxmod (0.72) enter the noisy-or.
+        let expect = 1.0 - (1.0 - 0.36) * (1.0 - 0.72);
         assert!((v.score - expect).abs() < 1e-9, "{} vs {expect}", v.score);
-        assert_eq!(v.agreeing_sources, 3);
+        assert_eq!(v.agreeing_sources, 2, "local and the acting source only");
+        assert!(v.corroborated);
+    }
+
+    #[test]
+    fn corroborated_when_another_source_agrees() {
+        let p = pax(&[("Spam", 1.0)]);
+        let spam = spam_model();
+        let v = fz(&Inputs { paxmod: Some(&p), jev: Some(&spam), ..Default::default() });
+        assert!(v.corroborated);
+        let clean = clean_model();
+        let v = fz(&Inputs { paxmod: Some(&p), jev: Some(&clean), ..Default::default() });
+        assert!(!v.corroborated);
+        assert!(v.evidence.iter().any(|e| e == "note: no second source agreed; flag only"), "{:?}", v.evidence);
+        let strong = local(0.6);
+        let v = fz(&Inputs { local: Some(&strong), paxmod: Some(&p), jev: Some(&clean), ..Default::default() });
+        assert!(v.corroborated);
+        let weak = local(0.35);
+        let v = fz(&Inputs { local: Some(&weak), paxmod: Some(&p), jev: Some(&clean), ..Default::default() });
+        assert!(!v.corroborated);
+        // local alone (no model responded): outage behavior is unchanged
+        let v = fz(&Inputs { local: Some(&strong), ..Default::default() });
+        assert!(v.corroborated);
+        assert!(!v.evidence.iter().any(|e| e.starts_with("note:")));
+        assert_eq!(FusionConfig::default().w_pplx, 0.9);
+    }
+
+    #[test]
+    fn corroborated_by_pplx_when_paxmod_acts() {
+        let p = pax(&[("Spam", 1.0)]);
+        let spam = spam_model();
+        let v = fz(&Inputs { paxmod: Some(&p), pplx: Some(&spam), ..Default::default() });
+        assert!(v.corroborated);
+        assert!(v.evidence.iter().any(|e| e.starts_with("pplx:class=spam")), "{:?}", v.evidence);
+    }
+
+    #[test]
+    fn paxmod_acts_models_report_only() {
+        let p = pax(&[("Spam", 0.1)]);
+        let m = spam_model();
+        let v = fz(&Inputs { paxmod: Some(&p), pplx: Some(&m), jev: Some(&m), ..Default::default() });
+        assert!((v.score - 0.45).abs() < 1e-9, "{}", v.score);
+        assert_ne!(v.label, Label::Clean);
+        assert_eq!(v.agreeing_sources, 0);
+    }
+
+    #[test]
+    fn local_plus_report_only_cannot_cross_delete() {
+        let p = pax(&[("Spam", 0.0)]);
+        let m = spam_model();
+        let l = local(0.6);
+        let v = fz(&Inputs { local: Some(&l), paxmod: Some(&p), pplx: Some(&m), jev: Some(&m), ..Default::default() });
+        assert!(v.score < 0.5, "{}", v.score);
+    }
+
+    #[test]
+    fn pplx_acts_when_paxmod_missing() {
+        let spam = spam_model();
+        let clean = clean_model();
+        let v = fz(&Inputs { pplx: Some(&spam), jev: Some(&spam), ..Default::default() });
+        assert!((v.score - 0.9).abs() < 1e-9, "{}", v.score);
+        let v = fz(&Inputs { pplx: Some(&spam), jev: Some(&clean), ..Default::default() });
+        assert!((v.score - 0.9).abs() < 1e-9, "{}", v.score);
+        let v = fz(&Inputs { pplx: Some(&clean), jev: Some(&spam), ..Default::default() });
+        assert!((v.score - 0.45).abs() < 1e-9, "{}", v.score);
+    }
+
+    #[test]
+    fn jev_acts_when_paxmod_and_pplx_missing() {
+        let spam = spam_model();
+        let v = fz(&Inputs { jev: Some(&spam), ..Default::default() });
+        assert!((v.score - 0.9).abs() < 1e-9, "{}", v.score);
+    }
+
+    #[test]
+    fn report_cap_parameter_is_respected() {
+        let p = pax(&[("Spam", 0.0)]);
+        let m = spam_model();
+        let v = fuse(&Inputs { paxmod: Some(&p), pplx: Some(&m), jev: Some(&m), ..Default::default() }, &cfg(), 0.4, 0.2);
+        assert!((v.score - 0.2).abs() < 1e-9, "{}", v.score);
+    }
+
+    #[test]
+    fn local_alone_stands_alone() {
+        let l = local(0.6);
+        let v = fz(&Inputs { local: Some(&l), ..Default::default() });
+        assert!((v.score - 0.6).abs() < 1e-9, "{}", v.score);
+        // with any provider response the local weight applies again
+        let clean = clean_model();
+        let v = fz(&Inputs { local: Some(&l), jev: Some(&clean), ..Default::default() });
+        assert!((v.score - 0.36).abs() < 1e-9, "{}", v.score);
+    }
+
+    #[test]
+    fn report_only_scam_class_cannot_enable_kick_or_ban() {
+        let p = pax(&[("Spam", 0.0)]);
+        let m = JevResult {
+            class: "scam_phishing".into(),
+            class_probs: [("scam_phishing".to_string(), 1.0), ("legitimate".to_string(), 0.0)].into_iter().collect(),
+            ..Default::default()
+        };
+        let v = fz(&Inputs { paxmod: Some(&p), pplx: Some(&m), jev: Some(&m), ..Default::default() });
+        assert_eq!(v.agreeing_sources, 0);
+        let ladder = crate::config::LadderConfig::default();
+        assert!(ladder.enable_kick && ladder.enable_ban);
+        for tier in [Tier::Quarantine, Tier::Fresh, Tier::Established] {
+            let a = crate::policy::decide(tier, &v, &MemberHistory::default(), &ladder);
+            assert!(a <= Action::Flag, "{tier:?} -> {a:?}");
+        }
     }
 
     #[test]
@@ -200,7 +378,7 @@ mod tests {
     #[test]
     fn abuse_label_and_separate_fusion() {
         let p = pax(&[("Harassment", 0.9), ("Threatening", 0.8)]);
-        let v = fuse(&Inputs { paxmod: Some(&p), ..Default::default() }, &cfg(), 0.4);
+        let v = fuse(&Inputs { paxmod: Some(&p), ..Default::default() }, &cfg(), 0.4, CAP);
         assert_eq!(v.label, Label::Abuse);
         assert!(v.abuse_score > v.spam_score);
     }
@@ -223,14 +401,14 @@ mod tests {
     #[test]
     fn scam_label_from_jev_class() {
         let j = jev("scam_phishing", 0.05);
-        let v = fuse(&Inputs { jev: Some(&j), ..Default::default() }, &cfg(), 0.4);
+        let v = fuse(&Inputs { jev: Some(&j), ..Default::default() }, &cfg(), 0.4, CAP);
         assert_eq!(v.label, Label::Scam);
     }
 
     #[test]
     fn below_threshold_is_clean() {
         let l = LocalResult::from_signals(vec![Signal { name: "x".into(), weight: 0.3 }]);
-        let v = fuse(&Inputs { local: Some(&l), ..Default::default() }, &cfg(), 0.4);
+        let v = fuse(&Inputs { local: Some(&l), ..Default::default() }, &cfg(), 0.4, CAP);
         assert_eq!(v.label, Label::Clean);
     }
 
@@ -238,7 +416,7 @@ mod tests {
     fn evidence_lists_rules_and_top_categories() {
         let p = pax(&[("Spam", 0.9), ("Harassment", 0.1)]);
         let l = LocalResult::from_signals(vec![Signal { name: "flood".into(), weight: 0.5 }]);
-        let v = fuse(&Inputs { local: Some(&l), paxmod: Some(&p), ..Default::default() }, &cfg(), 0.4);
+        let v = fuse(&Inputs { local: Some(&l), paxmod: Some(&p), ..Default::default() }, &cfg(), 0.4, CAP);
         assert!(v.evidence.iter().any(|e| e.starts_with("rule:flood")));
         assert!(v.evidence.iter().any(|e| e.starts_with("paxmod:Spam")));
         assert!(!v.evidence.iter().any(|e| e.contains("Harassment")));
@@ -253,7 +431,7 @@ mod tests {
         let delete = crate::config::LadderConfig::default().quarantine.delete.unwrap();
         // Sanity floor: an idealized local score of exactly 1.0 fuses to w_local.
         let perfect = LocalResult::from_signals(vec![Signal { name: "x".into(), weight: 1.0 }]);
-        let v = fuse(&Inputs { local: Some(&perfect), ..Default::default() }, &cfg(), 0.4);
+        let v = fuse(&Inputs { local: Some(&perfect), ..Default::default() }, &cfg(), 0.4, CAP);
         assert!(v.score >= delete, "perfect local score fuses to {:.6}, below delete {delete}", v.score);
         // The realistic ceiling: every local rule firing at full weight.
         let w = crate::config::RuleWeights::default();
@@ -267,7 +445,7 @@ mod tests {
             Signal { name: "blocked_domain".into(), weight: w.blocked_domain },
             Signal { name: "image_text_bait".into(), weight: w.image_text_bait },
         ]);
-        let v = fuse(&Inputs { local: Some(&maxed), ..Default::default() }, &cfg(), 0.4);
+        let v = fuse(&Inputs { local: Some(&maxed), ..Default::default() }, &cfg(), 0.4, CAP);
         assert!(v.score >= delete, "max local score {:.4} fuses to {:.6}, below delete {delete}", maxed.score, v.score);
     }
 
@@ -289,7 +467,7 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        let v = fuse(&Inputs { jev: Some(&j), ..Default::default() }, &cfg(), 0.4);
+        let v = fuse(&Inputs { jev: Some(&j), ..Default::default() }, &cfg(), 0.4, CAP);
         assert_eq!(v.label, Label::Abuse, "spam {:.3} abuse {:.3}", v.spam_score, v.abuse_score);
     }
 
