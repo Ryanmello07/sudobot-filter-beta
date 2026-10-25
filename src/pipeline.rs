@@ -1763,6 +1763,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_survives_a_failing_model_and_keeps_local_reasons() {
+        let now = Utc::now();
+        // Perplexity errors, Jev flags: no panic, Jev's reason still shows
+        let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::new(Err(ProviderError::Server(503))), FakeJev::spam(), false, 0.99, FakeSink::default()).await;
+        assert!(h.p.handle_join(join_ev(8, "alice", "Alice", old_user(8)), now).await);
+        {
+            let n = h.log.notices.lock().unwrap();
+            assert_eq!(n.len(), 1);
+            assert!(n[0].contains("Jev flagged name"), "{}", n[0]);
+            assert!(!n[0].contains("Perplexity flagged name"), "{}", n[0]);
+        }
+        // both error, local name rule hits: flagged by the local reason only
+        let h = harness_full(
+            Config::default(),
+            FakePax::spam(0.0),
+            FakeJev::new(Err(ProviderError::Server(503))),
+            FakeJev::new(Err(ProviderError::Server(503))),
+            false,
+            0.99,
+            FakeSink::default(),
+        )
+        .await;
+        assert!(h.p.handle_join(join_ev(8, "FREE NITRO giveaway", "x", old_user(8)), now).await);
+        let n = h.log.notices.lock().unwrap();
+        assert_eq!(n.len(), 1);
+        assert!(!n[0].contains("Jev flagged name") && !n[0].contains("Perplexity flagged name"), "{}", n[0]);
+        assert!(h.pplx.n() >= 1 && h.jev.n() >= 1, "both models were tried (server errors may be retried)");
+    }
+
+    #[tokio::test]
+    async fn join_with_only_username_or_multibyte_name_is_safe() {
+        let now = Utc::now();
+        let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::clean(), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        assert!(!h.p.handle_join(join_ev(8, "alice", "", old_user(8)), now).await);
+        assert_eq!((h.pplx.n(), h.jev.n(), h.pax.n()), (1, 1, 0), "a username alone is still screened");
+        let long = "é".repeat(300);
+        h.p.handle_join(join_ev(9, &long, &long, old_user(9)), now).await;
+        assert_eq!((h.pplx.n(), h.jev.n()), (2, 2));
+    }
+
+    #[tokio::test]
     async fn join_models_get_name_state() {
         let now = Utc::now();
         let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::clean(), FakeJev::clean(), false, 0.99, FakeSink::default()).await;

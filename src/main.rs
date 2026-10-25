@@ -2,7 +2,7 @@ use serenity::all::*;
 use std::sync::Arc;
 use std::time::Duration;
 use sudobot_chat_guard::budget::{Budget, Provider};
-use sudobot_chat_guard::config::{load_policy, Config, Env};
+use sudobot_chat_guard::config::{load_policy, model_alias_warning, policy_problem, Config, Env};
 use sudobot_chat_guard::discord::actions::DiscordSink;
 use sudobot_chat_guard::discord::dispatch::Dispatcher;
 use sudobot_chat_guard::discord::handler::{Handler, State};
@@ -15,7 +15,7 @@ use sudobot_chat_guard::store::Store;
 fn warn_if_placeholder(name: &str, v: &sudobot_chat_guard::secret::Secret) {
     let s = v.expose();
     if s.is_empty() || s.contains("dummy") || s.contains("replace") {
-        tracing::warn!("{name} looks like a placeholder: that provider will reject requests and the bot will run on local rules only");
+        tracing::warn!("{name} looks like a placeholder: that provider will reject requests and the bot will run on local rules only (PPQ_API_KEY covers both Jev and Perplexity)");
     }
 }
 
@@ -31,6 +31,11 @@ async fn main() -> anyhow::Result<()> {
     warn_if_placeholder("PAXMOD_API_KEY", &env.paxmod_key);
     warn_if_placeholder("PPQ_API_KEY", &env.ppq_key);
     warn_if_placeholder("OCR_API_KEY", &env.ocr_key);
+    for (var, model) in [("JEV_MODEL", &env.jev_model), ("PPLX_MODEL", &env.pplx_model)] {
+        if let Some(w) = model_alias_warning(var, model) {
+            tracing::warn!("{w}");
+        }
+    }
 
     if let Some(path) = env.database_url.strip_prefix("sqlite://") {
         if let Some(dir) = std::path::Path::new(path).parent() {
@@ -42,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let timeout = Duration::from_millis(env.provider_timeout_ms);
     let policy = load_policy(&env.policy_file);
     if policy.is_none() {
-        tracing::warn!("POLICY_FILE {} is missing, unreadable or empty: ppq models run without the policy question", env.policy_file);
+        tracing::warn!("{}", policy_problem(&env.policy_file));
     }
     let budgets = Budgets {
         paxmod: Arc::new(Budget::new(env.paxmod_cap, env.reserved_share)),

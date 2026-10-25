@@ -644,6 +644,21 @@ pub fn load_policy(path: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// Why `load_policy` returned `None`, for the boot log: a missing file is expected, an
+/// unreadable one carries the OS error.
+pub fn policy_problem(path: &str) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(_) => format!("POLICY_FILE {path} is empty: ppq models run without the policy question"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!("POLICY_FILE {path} is missing: ppq models run without the policy question"),
+        Err(e) => format!("POLICY_FILE {path} exists but cannot be read ({e}): ppq models run without the policy question"),
+    }
+}
+
+/// ppq model ids are `vendor/name`; an alias such as `jev-latest` does not exist there.
+pub fn model_alias_warning(var_name: &str, model: &str) -> Option<String> {
+    (!model.contains('/')).then(|| format!("{var_name}={model:?} has no '/': ppq model ids look like vendor/name, and aliases such as jev-latest do not exist, so every request to it will fail"))
+}
+
 fn var(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
@@ -717,6 +732,26 @@ mod tests {
         for p in [blank, text, bad] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn policy_problem_distinguishes_missing_empty_and_unreadable() {
+        let missing = std::env::temp_dir().join(format!("sudobot_policy_{}_missing2", std::process::id()));
+        assert!(policy_problem(missing.to_str().unwrap()).contains("is missing"));
+        let blank = temp_file("blank2", b"\n");
+        assert!(policy_problem(blank.to_str().unwrap()).contains("is empty"));
+        let bad = temp_file("bad2", &[0xff, 0xfe]);
+        let msg = policy_problem(bad.to_str().unwrap());
+        assert!(msg.contains("cannot be read") && msg.contains("UTF-8"), "{msg}");
+        for p in [blank, bad] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn model_alias_warning_flags_ids_without_a_slash() {
+        assert!(model_alias_warning("JEV_MODEL", "jev-latest").unwrap().contains("JEV_MODEL"));
+        assert!(model_alias_warning("PPLX_MODEL", "perplexity/pplx-decider-v1.2").is_none());
     }
 
     #[test]
