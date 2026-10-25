@@ -799,34 +799,33 @@ impl Pipeline {
             reasons.push("blocked domain in name".into());
         }
 
-        // Providers on the name fields. No context_id: names must not pollute conversations.
-        let now_p = now;
-        let g = guarded(&self.d.budgets.paxmod, Priority::Low, now_p, || self.d.paxmod.moderate(names.trim(), Some(j.user_id), None)).await;
-        if g.called {
-            let _ = self.d.store.record_usage("paxmod", 1, g.result.is_err() as i64, now).await;
-        }
-        if let Ok(r) = g.result {
-            let (spam, abuse) = crate::fusion::paxmod_risks(&r);
-            if spam >= 0.7 || abuse >= 0.8 {
-                reasons.push(format!("Paxmod flagged name ({:.2})", spam.max(abuse)));
+        // Names go to Perplexity and Jev only: Paxmod's Player Context is per user_id
+        // and names would pollute it. The "name:" key keeps these cache entries apart
+        // from message entries.
+        if !names.trim().is_empty() {
+            let state = JevState {
+                message: names.trim().to_string(),
+                account_age_days: (now - j.profile.account_created).num_days(),
+                minutes_in_guild: Some(0),
+                has_default_avatar: j.profile.has_default_avatar,
+                role_count: j.profile.role_count,
+                ..Default::default()
+            };
+            let ((pplx, _, _), (jev, _, _)) = tokio::join!(
+                self.run_classifier(Model::Pplx, j.guild_id, &names, state.clone(), Ask::Name, Priority::Low, now, "name:"),
+                self.run_classifier(Model::Jev, j.guild_id, &names, state, Ask::Name, Priority::Low, now, "name:")
+            );
+            if let Some(r) = pplx {
+                let spam = crate::fusion::jev_risks(&r).0;
+                if spam >= 0.8 {
+                    reasons.push(format!("Perplexity flagged name ({spam:.2})"));
+                }
             }
-        }
-        let state = JevState {
-            message: names.trim().to_string(),
-            account_age_days: (now - j.profile.account_created).num_days(),
-            minutes_in_guild: Some(0),
-            has_default_avatar: j.profile.has_default_avatar,
-            role_count: j.profile.role_count,
-            ..Default::default()
-        };
-        let g = guarded(&self.d.budgets.jev, Priority::Low, now_p, || self.d.jev.assess(&state, Ask::Name)).await;
-        if g.called {
-            let _ = self.d.store.record_usage("jev", 1, g.result.is_err() as i64, now).await;
-        }
-        if let Ok(r) = g.result {
-            let (spam, _) = crate::fusion::jev_risks(&r);
-            if spam >= 0.8 {
-                reasons.push(format!("Jev flagged name ({spam:.2})"));
+            if let Some(r) = jev {
+                let spam = crate::fusion::jev_risks(&r).0;
+                if spam >= 0.8 {
+                    reasons.push(format!("Jev flagged name ({spam:.2})"));
+                }
             }
         }
 
@@ -896,11 +895,12 @@ mod tests {
     struct FakeJev {
         result: Result<JevResult, ProviderError>,
         calls: Mutex<u32>,
+        states: Mutex<Vec<JevState>>,
         flip_to_observe: Mutex<Option<Store>>,
     }
     impl FakeJev {
         fn new(r: Result<JevResult, ProviderError>) -> Arc<Self> {
-            Arc::new(FakeJev { result: r, calls: Mutex::new(0), flip_to_observe: Mutex::new(None) })
+            Arc::new(FakeJev { result: r, calls: Mutex::new(0), states: Mutex::new(vec![]), flip_to_observe: Mutex::new(None) })
         }
         fn clean() -> Arc<Self> {
             Self::new(Ok(JevResult { class: "legitimate".into(), class_probs: [("legitimate".to_string(), 1.0)].into(), ..Default::default() }))
@@ -914,8 +914,9 @@ mod tests {
     }
     #[async_trait]
     impl Classifier for FakeJev {
-        async fn assess(&self, _s: &JevState, _ask: Ask) -> Result<JevResult, ProviderError> {
+        async fn assess(&self, s: &JevState, _ask: Ask) -> Result<JevResult, ProviderError> {
             *self.calls.lock().unwrap() += 1;
+            self.states.lock().unwrap().push(s.clone());
             let st = self.flip_to_observe.lock().unwrap().clone();
             if let Some(st) = st {
                 st.set_mode(1, Mode::Observe, 0).await.unwrap();
@@ -1710,13 +1711,91 @@ mod tests {
         assert!(h.sink.empty());
         assert!(h.p.store().history(1, 7, Utc::now()).await.unwrap().join_flag);
         assert_eq!(h.log.notices.lock().unwrap().len(), 1);
-        // an ordinary join is not flagged and Paxmod saw no context_id
+        // an ordinary join is not flagged
         let ok = h
             .p
             .handle_join(JoinEvent { guild_id: 1, user_id: 8, username: "alice".into(), display_name: "Alice".into(), profile: old_user(8) }, Utc::now())
             .await;
         assert!(!ok);
-        assert!(h.pax.calls.lock().unwrap().iter().all(|c| c.2.is_none()));
+        assert_eq!(h.pax.n(), 0, "Paxmod never sees names");
+    }
+
+    fn join_ev(user: u64, username: &str, display: &str, profile: MemberProfile) -> JoinEvent {
+        JoinEvent { guild_id: 1, user_id: user, username: username.into(), display_name: display.into(), profile }
+    }
+
+    #[tokio::test]
+    async fn join_flags_when_either_model_flags_name() {
+        let now = Utc::now();
+        let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::spam(), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        assert!(h.p.handle_join(join_ev(8, "alice", "Alice", old_user(8)), now).await);
+        {
+            let n = h.log.notices.lock().unwrap();
+            assert_eq!(n.len(), 1);
+            assert!(n[0].contains("Perplexity flagged name"), "{}", n[0]);
+            assert!(!n[0].contains("Jev flagged name"), "{}", n[0]);
+        }
+        assert_eq!(h.pax.n(), 0);
+
+        let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::clean(), FakeJev::spam(), false, 0.99, FakeSink::default()).await;
+        assert!(h.p.handle_join(join_ev(8, "alice", "Alice", old_user(8)), now).await);
+        {
+            let n = h.log.notices.lock().unwrap();
+            assert_eq!(n.len(), 1);
+            assert!(n[0].contains("Jev flagged name"), "{}", n[0]);
+            assert!(!n[0].contains("Perplexity flagged name"), "{}", n[0]);
+        }
+        assert!(h.sink.empty(), "join screening never acts");
+
+        let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::clean(), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        assert!(!h.p.handle_join(join_ev(8, "alice", "Alice", old_user(8)), now).await);
+        assert!(h.log.notices.lock().unwrap().is_empty());
+        assert_eq!((h.pplx.n(), h.jev.n(), h.pax.n()), (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn join_with_blank_names_skips_models() {
+        let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::spam(), FakeJev::spam(), false, 0.99, FakeSink::default()).await;
+        let flagged = h.p.handle_join(join_ev(8, "", "", old_user(8)), Utc::now()).await;
+        assert!(!flagged);
+        assert_eq!((h.pplx.n(), h.jev.n(), h.pax.n()), (0, 0, 0));
+        assert!(h.log.notices.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_models_get_name_state() {
+        let now = Utc::now();
+        let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::clean(), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        let mut p = profile(8, 24 * 5 + 3, 0);
+        p.has_default_avatar = true;
+        p.role_count = 2;
+        h.p.handle_join(JoinEvent { guild_id: 1, user_id: 8, username: "alice".into(), display_name: "Alice".into(), profile: p.clone() }, now).await;
+        let expect_days = (now - p.account_created).num_days();
+        for fake in [&h.pplx, &h.jev] {
+            let st = fake.states.lock().unwrap();
+            assert_eq!(st.len(), 1);
+            assert_eq!(st[0].message, "alice Alice");
+            assert_eq!(st[0].account_age_days, expect_days);
+            assert_eq!(st[0].account_age_days, 5);
+            assert!(st[0].has_default_avatar);
+            assert_eq!(st[0].minutes_in_guild, Some(0));
+            assert_eq!(st[0].role_count, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn join_name_cache_is_separate_from_message_cache() {
+        let now = Utc::now();
+        let h = harness_full(Config::default(), FakePax::spam(0.0), FakeJev::clean(), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        // a message whose text equals the name string must not satisfy the name lookup
+        h.p.handle(msg(1, 8, "alice Alice", new_user(8)), now).await;
+        assert_eq!((h.pplx.n(), h.jev.n()), (1, 1), "the message was scanned");
+        let before = (h.pplx.n(), h.jev.n());
+        h.p.handle_join(join_ev(8, "alice", "Alice", old_user(8)), now).await;
+        assert_eq!((h.pplx.n(), h.jev.n()), (before.0 + 1, before.1 + 1));
+        // the same names again hit the name cache
+        h.p.handle_join(join_ev(9, "alice", "Alice", old_user(9)), now).await;
+        assert_eq!((h.pplx.n(), h.jev.n()), (before.0 + 1, before.1 + 1));
     }
 
     #[tokio::test]
@@ -1729,11 +1808,11 @@ mod tests {
         // established member in the same channel: context-fed to Paxmod only
         h.p.handle(msg(2, 8, "hi there friend", old_user(8)), now).await;
         h.p.drain_feed().await;
-        // join screening calls both providers at Low priority
+        // join screening calls Perplexity and Jev (never Paxmod) at Low priority
         h.p.handle_join(JoinEvent { guild_id: 1, user_id: 9, username: "alice".into(), display_name: "a".into(), profile: old_user(9) }, now).await;
-        assert_eq!(h.p.store().usage_today("paxmod", now).await.0, 3, "scan + feed + join screening");
+        assert_eq!(h.p.store().usage_today("paxmod", now).await.0, 2, "scan + feed; join screening never calls Paxmod");
         assert_eq!(h.p.store().usage_today("jev", now).await.0, 2, "scan + join screening");
-        assert_eq!(h.p.store().usage_today("pplx", now).await.0, 1, "scan only until join screening uses Perplexity");
+        assert_eq!(h.p.store().usage_today("pplx", now).await.0, 2, "scan + join screening");
     }
 
     #[tokio::test]
