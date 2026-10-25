@@ -49,3 +49,17 @@ cargo test --test live_api -- --ignored --nocapture
 
 Each live test skips (passes) when its provider key is missing. See the doc comment
 at the top of `tests/live_api.rs`. These consume real API quota.
+
+Environment variables read by the live tests (all from the shell or `.env`; never commit keys):
+
+- `PPQ_API_KEY`: one ppq key serves both Jev and Perplexity.
+- `PPQ_BASE_URL`: defaults to `https://api.ppq.ai/v1`.
+- `JEV_MODEL`: defaults to `typesafe/jev-1.13`. Must be a full ppq id (`vendor/name`);
+  aliases such as `jev-latest` are rejected by ppq with a 400.
+- `PPLX_MODEL`: defaults to `perplexity/pplx-decider-v1.2`.
+- `PAXMOD_API_KEY`, `OCR_API_KEY`: for the Paxmod and OCR.space tests.
+- `POLICY_FILE`: defaults to `policy.txt`; sent to the ppq models as the policy question.
+
+Run one model only with a filter, e.g. `live_jev` or `live_pplx`. Variables already set
+in the shell take precedence over `.env`, so a one-off override is
+`JEV_MODEL=typesafe/jev-1.13 cargo test --test live_api -- --ignored --nocapture live_jev`.

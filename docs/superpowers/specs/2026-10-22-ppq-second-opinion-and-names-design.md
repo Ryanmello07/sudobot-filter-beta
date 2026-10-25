@@ -90,3 +90,7 @@ Owner priority, stated after these: **a wrong action on a legitimate member is m
 - Where the fallback/second-opinion distinction lives (extra field on `Inputs` vs a parameter to `fuse`).
 - Module layout: one generic ppq decisions client vs two thin wrappers; trait naming (`Classifier` is reused for both).
 - Migration numbering and column details; test fixture layout.
+
+## Implemented
+
+Commits `c66a7b7..6465589` on `main` (PpqClient, ppq env/config wiring, corroboration gate in `4f01f27`, Perplexity + Jev on every scanned message, join name screening, boot warnings). Offline gates pass (clippy `-D warnings`, `cargo test` 211 lib tests, `cargo test --test simulations` 5, `cargo build --release --bins`). Live smoke test of both ppq models (`live_jev`, `live_pplx`) passed: scam scores above benign, latency under 1s each. Deploy note: `JEV_MODEL` must be a full ppq id such as `typesafe/jev-1.13`; the alias `jev-latest` is rejected by ppq (400), and the bot now logs a boot warning for any model id without a `/`. Benchmark numbers are in the Task 1 report.

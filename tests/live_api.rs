@@ -1,9 +1,10 @@
-//! Live API quality checks against the real Paxmod, Jev (via ppq) and OCR.space
+//! Live API quality checks against the real Paxmod, Jev and Perplexity (both via ppq) and OCR.space
 //! endpoints. These are NOT part of the default test run.
 //!
 //! How to run:
 //!   1. `cp .env.example .env` and fill in real keys (PAXMOD_API_KEY,
-//!      PPQ_API_KEY, OCR_API_KEY; DISCORD_TOKEN is not needed here).
+//!      PPQ_API_KEY, OCR_API_KEY; DISCORD_TOKEN is not needed here). Optional:
+//!      PPQ_BASE_URL, JEV_MODEL, PPLX_MODEL, POLICY_FILE.
 //!   2. `cargo test --test live_api -- --ignored --nocapture`
 //!      (add a filter, e.g. `live_paxmod`, to run just one).
 //!
@@ -80,16 +81,15 @@ async fn live_paxmod_scam_scores_above_benign() {
     );
 }
 
-// ---------- Jev (ppq) ----------
+// ---------- Jev and Perplexity (both via ppq) ----------
 
-#[tokio::test]
-#[ignore = "live API: consumes real Jev/ppq quota"]
-async fn live_jev_scam_scores_above_benign() {
+async fn ppq_scam_scores_above_benign(label: &str, model: &str) {
     let Some(e) = env() else { return };
     if e.ppq_key.is_empty() {
         return skip("PPQ_API_KEY");
     }
-    let client = PpqClient::new(&e.ppq_base, e.ppq_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)));
+    let policy = sudobot_chat_guard::config::load_policy(&e.policy_file);
+    let client = PpqClient::new(&e.ppq_base, e.ppq_key.clone(), model, policy, Duration::from_millis(e.provider_timeout_ms.max(10_000)));
 
     let scam = JevState {
         message: "FREE NITRO click bit.ly/xxx claim now".into(),
@@ -111,16 +111,16 @@ async fn live_jev_scam_scores_above_benign() {
     let mut spam_risks = Vec::new();
     for st in [&scam, &benign] {
         let t0 = Instant::now();
-        let r = client.assess(st, Ask::Message).await.expect("jev request must succeed and parse");
+        let r = client.assess(st, Ask::Message).await.unwrap_or_else(|e| panic!("{label} request must succeed and parse: {e}"));
         let latency = t0.elapsed();
         let (spam, abuse) = jev_risks(&r);
         println!(
-            "jev {:?}: class={} probs={:?} spam={spam:.3} abuse={abuse:.3} latency={latency:.2?}",
+            "{label} ({model}) {:?}: class={} probs={:?} spam={spam:.3} abuse={abuse:.3} latency={latency:.2?}",
             st.message, r.class, r.class_probs
         );
         assert!(!r.class_probs.is_empty(), "class_probs keys must be present");
         assert!(r.class_probs.values().all(|v| (0.0..=1.0).contains(v)), "class_probs out of [0,1]");
-        assert!(latency < Duration::from_secs(5), "jev latency {latency:.2?} >= 5s");
+        assert!(latency < Duration::from_secs(5), "{label} latency {latency:.2?} >= 5s");
         spam_risks.push(spam);
     }
     assert!(
@@ -129,6 +129,20 @@ async fn live_jev_scam_scores_above_benign() {
         spam_risks[0],
         spam_risks[1]
     );
+}
+
+#[tokio::test]
+#[ignore = "live API: consumes real Jev/ppq quota"]
+async fn live_jev_scam_scores_above_benign() {
+    let Some(e) = env() else { return };
+    ppq_scam_scores_above_benign("jev", &e.jev_model).await;
+}
+
+#[tokio::test]
+#[ignore = "live API: consumes real Perplexity/ppq quota"]
+async fn live_pplx_scam_scores_above_benign() {
+    let Some(e) = env() else { return };
+    ppq_scam_scores_above_benign("pplx", &e.pplx_model).await;
 }
 
 // ---------- OCR.space ----------
