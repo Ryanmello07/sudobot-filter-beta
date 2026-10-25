@@ -2,7 +2,7 @@ use serenity::all::*;
 use std::sync::Arc;
 use std::time::Duration;
 use sudobot_chat_guard::budget::{Budget, Provider};
-use sudobot_chat_guard::config::{Config, Env};
+use sudobot_chat_guard::config::{load_policy, Config, Env};
 use sudobot_chat_guard::discord::actions::DiscordSink;
 use sudobot_chat_guard::discord::dispatch::Dispatcher;
 use sudobot_chat_guard::discord::handler::{Handler, State};
@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let env = Env::from_env()?;
     let cfg = Arc::new(Config::load(&env.config_path)?);
     warn_if_placeholder("PAXMOD_API_KEY", &env.paxmod_key);
-    warn_if_placeholder("TYPESAFE_API_KEY", &env.typesafe_key);
+    warn_if_placeholder("PPQ_API_KEY", &env.ppq_key);
     warn_if_placeholder("OCR_API_KEY", &env.ocr_key);
 
     if let Some(path) = env.database_url.strip_prefix("sqlite://") {
@@ -40,13 +40,23 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::connect(&env.database_url).await?;
 
     let timeout = Duration::from_millis(env.provider_timeout_ms);
+    let policy = load_policy(&env.policy_file);
+    if policy.is_none() {
+        tracing::warn!("POLICY_FILE {} is missing, unreadable or empty: ppq models run without the policy question", env.policy_file);
+    }
     let budgets = Budgets {
         paxmod: Arc::new(Budget::new(env.paxmod_cap, env.reserved_share)),
+        pplx: Arc::new(Budget::new(env.pplx_cap, env.reserved_share)),
         jev: Arc::new(Budget::new(env.jev_cap, env.reserved_share)),
         ocr: Arc::new(Budget::new(env.ocr_cap, env.reserved_share)),
     };
     let now = chrono::Utc::now();
-    for (p, b) in [(Provider::Paxmod, &budgets.paxmod), (Provider::Jev, &budgets.jev), (Provider::Ocr, &budgets.ocr)] {
+    for (p, b) in [
+        (Provider::Paxmod, &budgets.paxmod),
+        (Provider::Pplx, &budgets.pplx),
+        (Provider::Jev, &budgets.jev),
+        (Provider::Ocr, &budgets.ocr),
+    ] {
         b.preload(store.usage_today(p.name(), now).await.0);
     }
 
@@ -62,7 +72,8 @@ async fn main() -> anyhow::Result<()> {
         cfg: cfg.clone(),
         store: store.clone(),
         paxmod: Arc::new(PaxmodClient::new(&env.paxmod_base, env.paxmod_key.clone(), timeout)),
-        jev: Arc::new(PpqClient::new(&env.typesafe_base, env.typesafe_key.clone(), &env.jev_model, None, timeout)),
+        pplx: Arc::new(PpqClient::new(&env.ppq_base, env.ppq_key.clone(), &env.pplx_model, policy.clone(), timeout)),
+        jev: Arc::new(PpqClient::new(&env.ppq_base, env.ppq_key.clone(), &env.jev_model, policy, timeout)),
         ocr: Arc::new(OcrClient::new(&env.ocr_base, env.ocr_key.clone(), env.ocr_engine, Duration::from_millis(env.ocr_timeout_ms))),
         fetcher: Arc::new(HttpImageFetcher::new()),
         sink: Arc::new(DiscordSink { http: client.http.clone(), cache: client.cache.clone() }),

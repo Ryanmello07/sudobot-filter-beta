@@ -119,22 +119,29 @@ fn png() -> Vec<u8> {
 
 async fn sim(
     paxmod: Arc<dyn TextModerator>,
+    pplx: Arc<dyn Classifier>,
     jev: Arc<dyn Classifier>,
     ocr: Arc<dyn TextReader>,
     fetcher: Arc<dyn ImageFetcher>,
 ) -> Sim {
     let log = Arc::new(Log::default());
-    let (pb, jb, ob) = (Arc::new(Budget::new(1000, 0.5)), Arc::new(Budget::new(1000, 0.5)), Arc::new(Budget::new(1000, 0.5)));
+    let (pb, xb, jb, ob) = (
+        Arc::new(Budget::new(1000, 0.5)),
+        Arc::new(Budget::new(1000, 0.5)),
+        Arc::new(Budget::new(1000, 0.5)),
+        Arc::new(Budget::new(1000, 0.5)),
+    );
     let p = Pipeline::new(Deps {
         cfg: Arc::new(Config::default()),
         store: Store::memory().await.unwrap(),
         paxmod,
+        pplx,
         jev,
         ocr,
         fetcher,
         sink: Arc::new(NopSink),
         modlog: log.clone(),
-        budgets: Budgets { paxmod: pb.clone(), jev: jb.clone(), ocr: ob.clone() },
+        budgets: Budgets { paxmod: pb.clone(), pplx: xb.clone(), jev: jb.clone(), ocr: ob.clone() },
         ocr_max_upload: 1_000_000,
         roll: Arc::new(|| 0.99),
     });
@@ -187,11 +194,12 @@ async fn outage_all_providers_fails_open_breakers_open_announced_once() {
         Mock::given(method("POST")).respond_with(ResponseTemplate::new(500)).mount(&s).await;
         s
     };
-    let (ps, js, os) = (mk().await, mk().await, mk().await);
+    let (ps, xs, js, os) = (mk().await, mk().await, mk().await, mk().await);
     let t = std::time::Duration::from_millis(500);
     let sim = sim(
         Arc::new(PaxmodClient::new(&ps.uri(), Secret::new("k"), t)),
-        Arc::new(PpqClient::new(&js.uri(), Secret::new("k"), "jev-latest", None, t)),
+        Arc::new(PpqClient::new(&xs.uri(), Secret::new("k"), "perplexity/pplx-decider-v1.2", None, t)),
+        Arc::new(PpqClient::new(&js.uri(), Secret::new("k"), "typesafe/jev-1.13", None, t)),
         Arc::new(OcrClient::new(&os.uri(), Secret::new("k"), 2, t)),
         Arc::new(PngFetcher(png())),
     )
@@ -251,6 +259,7 @@ async fn flaky_provider_recovers_on_retry_with_single_budgeted_call() {
         Arc::new(Offline),
         Arc::new(Offline),
         Arc::new(Offline),
+        Arc::new(Offline),
     )
     .await;
 
@@ -283,6 +292,7 @@ async fn quota_429_marks_exhausted_and_skips_without_http() {
         Arc::new(Offline),
         Arc::new(Offline),
         Arc::new(Offline),
+        Arc::new(Offline),
     )
     .await;
 
@@ -303,7 +313,7 @@ async fn quota_429_marks_exhausted_and_skips_without_http() {
 #[tokio::test]
 async fn raid_two_hundred_identical_spam_messages_all_detected() {
     let off = Arc::new(Offline);
-    let sim = sim(off.clone(), off.clone(), off.clone(), off).await;
+    let sim = sim(off.clone(), off.clone(), off.clone(), off.clone(), off).await;
     const N: u64 = 200;
     const TEXT: &str = "FREE NITRO claim your reward at bit.ly/free-nitro now discord.gg/nitro";
 

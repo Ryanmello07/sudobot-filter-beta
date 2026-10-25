@@ -615,10 +615,13 @@ pub struct Env {
     pub paxmod_key: Secret,
     pub paxmod_base: String,
     pub paxmod_cap: u64,
-    pub typesafe_key: Secret,
-    pub typesafe_base: String,
+    pub ppq_key: Secret,
+    pub ppq_base: String,
     pub jev_model: String,
     pub jev_cap: u64,
+    pub pplx_model: String,
+    pub pplx_cap: u64,
+    pub policy_file: String,
     pub ocr_key: Secret,
     pub ocr_base: String,
     pub ocr_engine: u8,
@@ -631,6 +634,14 @@ pub struct Env {
     pub config_path: String,
     /// Guild whose admins may manage other servers' configs (`/guard config … guild:`).
     pub manager_guild_id: Option<u64>,
+}
+
+/// The moderation policy text sent to the ppq models. `None` when the file is missing,
+/// unreadable, not UTF-8, or blank; the bot then runs without the `policy` question.
+pub fn load_policy(path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -655,10 +666,13 @@ impl Env {
             paxmod_key: Secret::new(var("PAXMOD_API_KEY", "")),
             paxmod_base: var("PAXMOD_BASE_URL", "https://www.paxmod.com/api/v1"),
             paxmod_cap: num("PAXMOD_DAILY_CAP", 2000)?,
-            typesafe_key: Secret::new(var("TYPESAFE_API_KEY", "")),
-            typesafe_base: var("TYPESAFE_BASE_URL", "https://api.typesafe.ai/v1"),
-            jev_model: var("JEV_MODEL", "jev-latest"),
+            ppq_key: Secret::new(var("PPQ_API_KEY", "")),
+            ppq_base: var("PPQ_BASE_URL", "https://api.ppq.ai/v1"),
+            jev_model: var("JEV_MODEL", "typesafe/jev-1.13"),
             jev_cap: num("JEV_DAILY_CAP", 2000)?,
+            pplx_model: var("PPLX_MODEL", "perplexity/pplx-decider-v1.2"),
+            pplx_cap: num("PPLX_DAILY_CAP", 2000)?,
+            policy_file: var("POLICY_FILE", "policy.txt"),
             ocr_key: Secret::new(var("OCR_API_KEY", "")),
             ocr_base: var("OCR_BASE_URL", "https://api.ocr.space"),
             ocr_engine: num("OCR_ENGINE", 2)?,
@@ -683,6 +697,27 @@ impl Env {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("sudobot_policy_{}_{name}", std::process::id()));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_policy_missing_empty_and_trimmed() {
+        let missing = std::env::temp_dir().join(format!("sudobot_policy_{}_missing", std::process::id()));
+        assert_eq!(load_policy(missing.to_str().unwrap()), None);
+        let blank = temp_file("blank", b"  \n");
+        assert_eq!(load_policy(blank.to_str().unwrap()), None);
+        let text = temp_file("text", b" text \n");
+        assert_eq!(load_policy(text.to_str().unwrap()), Some("text".to_string()));
+        let bad = temp_file("bad", &[0xff, 0xfe]);
+        assert_eq!(load_policy(bad.to_str().unwrap()), None);
+        for p in [blank, text, bad] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 
     #[test]
     fn empty_config_gives_defaults() {

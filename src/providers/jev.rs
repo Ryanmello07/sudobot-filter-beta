@@ -80,6 +80,7 @@ pub struct PpqClient {
 
 impl PpqClient {
     pub fn new(base: &str, key: Secret, model: &str, policy: Option<String>, timeout: Duration) -> Self {
+        let policy = policy.filter(|p| !p.trim().is_empty());
         Self { http: http_client(timeout), base: base.trim_end_matches('/').into(), key, model: model.into(), policy }
     }
 
@@ -227,6 +228,16 @@ mod tests {
         assert!(q.get("policy").is_none());
         assert!(q.get("name_bad").is_none());
         assert_eq!(q.as_object().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn blank_policy_is_treated_as_none() {
+        for blank in ["", "   ", " \n\t"] {
+            let s = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_string(OK)).mount(&s).await;
+            client_with(&s, Some(blank)).assess(&Default::default(), Ask::Message).await.unwrap();
+            assert!(sent_questions(&s).await.get("policy").is_none(), "blank policy {blank:?} must be omitted");
+        }
     }
 
     #[tokio::test]

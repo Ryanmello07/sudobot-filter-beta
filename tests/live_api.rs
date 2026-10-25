@@ -1,9 +1,9 @@
-//! Live API quality checks against the real Paxmod, Jev (TypeSafe) and OCR.space
+//! Live API quality checks against the real Paxmod, Jev (via ppq) and OCR.space
 //! endpoints. These are NOT part of the default test run.
 //!
 //! How to run:
 //!   1. `cp .env.example .env` and fill in real keys (PAXMOD_API_KEY,
-//!      TYPESAFE_API_KEY, OCR_API_KEY; DISCORD_TOKEN is not needed here).
+//!      PPQ_API_KEY, OCR_API_KEY; DISCORD_TOKEN is not needed here).
 //!   2. `cargo test --test live_api -- --ignored --nocapture`
 //!      (add a filter, e.g. `live_paxmod`, to run just one).
 //!
@@ -80,16 +80,16 @@ async fn live_paxmod_scam_scores_above_benign() {
     );
 }
 
-// ---------- Jev / TypeSafe ----------
+// ---------- Jev (ppq) ----------
 
 #[tokio::test]
-#[ignore = "live API: consumes real Jev/TypeSafe quota"]
+#[ignore = "live API: consumes real Jev/ppq quota"]
 async fn live_jev_scam_scores_above_benign() {
     let Some(e) = env() else { return };
-    if e.typesafe_key.is_empty() {
-        return skip("TYPESAFE_API_KEY");
+    if e.ppq_key.is_empty() {
+        return skip("PPQ_API_KEY");
     }
-    let client = PpqClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)));
+    let client = PpqClient::new(&e.ppq_base, e.ppq_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)));
 
     let scam = JevState {
         message: "FREE NITRO click bit.ly/xxx claim now".into(),
@@ -179,8 +179,8 @@ async fn live_quality_gate_small_corpus() {
     let pax = (!e.paxmod_key.is_empty()).then(|| {
         PaxmodClient::new(&e.paxmod_base, e.paxmod_key.clone(), Duration::from_millis(e.provider_timeout_ms.max(10_000)))
     });
-    let jev = (!e.typesafe_key.is_empty()).then(|| {
-        PpqClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)))
+    let jev = (!e.ppq_key.is_empty()).then(|| {
+        PpqClient::new(&e.ppq_base, e.ppq_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)))
     });
     if pax.is_none() && jev.is_none() {
         return println!("SKIP: no provider keys set; fill .env to run the quality gate");

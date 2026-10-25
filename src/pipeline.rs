@@ -57,6 +57,7 @@ impl Outcome {
 
 pub struct Budgets {
     pub paxmod: Arc<Budget>,
+    pub pplx: Arc<Budget>,
     pub jev: Arc<Budget>,
     pub ocr: Arc<Budget>,
 }
@@ -65,6 +66,7 @@ pub struct Deps {
     pub cfg: Arc<Config>,
     pub store: Store,
     pub paxmod: Arc<dyn TextModerator>,
+    pub pplx: Arc<dyn Classifier>,
     pub jev: Arc<dyn Classifier>,
     pub ocr: Arc<dyn TextReader>,
     pub fetcher: Arc<dyn ImageFetcher>,
@@ -217,6 +219,7 @@ impl Pipeline {
     pub fn caps(&self) -> Vec<(&'static str, u64)> {
         vec![
             ("paxmod", self.d.budgets.paxmod.usage().2),
+            ("pplx", self.d.budgets.pplx.usage().2),
             ("jev", self.d.budgets.jev.usage().2),
             ("ocr", self.d.budgets.ocr.usage().2),
         ]
@@ -978,6 +981,8 @@ mod tests {
     struct H {
         p: Pipeline,
         pax: Arc<FakePax>,
+        #[allow(dead_code)] // asserted on once the pipeline calls Perplexity
+        pplx: Arc<FakeJev>,
         jev: Arc<FakeJev>,
         ocr: Arc<FakeOcr>,
         sink: Arc<FakeSink>,
@@ -993,6 +998,10 @@ mod tests {
     }
 
     async fn harness_with_cfg(cfg: Config, pax: Arc<FakePax>, jev: Arc<FakeJev>, enforce: bool, roll: f64, sink: FakeSink) -> H {
+        harness_full(cfg, pax, FakeJev::clean(), jev, enforce, roll, sink).await
+    }
+
+    async fn harness_full(cfg: Config, pax: Arc<FakePax>, pplx: Arc<FakeJev>, jev: Arc<FakeJev>, enforce: bool, roll: f64, sink: FakeSink) -> H {
         let store = Store::memory().await.unwrap();
         if enforce {
             store.set_mode(1, Mode::Enforce, 0).await.unwrap();
@@ -1004,16 +1013,22 @@ mod tests {
             cfg: Arc::new(cfg),
             store,
             paxmod: pax.clone(),
+            pplx: pplx.clone(),
             jev: jev.clone(),
             ocr: ocr.clone(),
             fetcher: Arc::new(FakeFetcher(png())),
             sink: sink.clone(),
             modlog: log.clone(),
-            budgets: Budgets { paxmod: Arc::new(Budget::new(1000, 0.5)), jev: Arc::new(Budget::new(1000, 0.5)), ocr: Arc::new(Budget::new(1000, 0.5)) },
+            budgets: Budgets {
+                paxmod: Arc::new(Budget::new(1000, 0.5)),
+                pplx: Arc::new(Budget::new(1000, 0.5)),
+                jev: Arc::new(Budget::new(1000, 0.5)),
+                ocr: Arc::new(Budget::new(1000, 0.5)),
+            },
             ocr_max_upload: 1_000_000,
             roll: Arc::new(move || roll),
         });
-        H { p, pax, jev, ocr, sink, log }
+        H { p, pax, pplx, jev, ocr, sink, log }
     }
 
     fn profile(user: u64, account_hours: i64, in_guild_minutes: i64) -> MemberProfile {

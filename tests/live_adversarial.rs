@@ -1,8 +1,8 @@
-//! Live adversarial-corpus quality check against the real Paxmod and Jev (TypeSafe)
+//! Live adversarial-corpus quality check against the real Paxmod and Jev (via ppq)
 //! endpoints. NOT part of the default test run.
 //!
 //! How to run:
-//!   1. `cp .env.example .env` and fill in PAXMOD_API_KEY and/or TYPESAFE_API_KEY.
+//!   1. `cp .env.example .env` and fill in PAXMOD_API_KEY and/or PPQ_API_KEY.
 //!   2. `cargo test --test live_adversarial -- --ignored --nocapture`
 //!
 //! The corpus lives at `tests/fixtures/adversarial-corpus.jsonl`, one JSON object
@@ -100,8 +100,8 @@ async fn live_adversarial_corpus_detection_rates() {
     let pax = (!e.paxmod_key.is_empty()).then(|| {
         PaxmodClient::new(&e.paxmod_base, e.paxmod_key.clone(), Duration::from_millis(e.provider_timeout_ms.max(10_000)))
     });
-    let jev = (!e.typesafe_key.is_empty()).then(|| {
-        PpqClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)))
+    let jev = (!e.ppq_key.is_empty()).then(|| {
+        PpqClient::new(&e.ppq_base, e.ppq_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)))
     });
     if pax.is_none() && jev.is_none() {
         return println!("SKIP: no provider keys set; fill .env to run the adversarial corpus");

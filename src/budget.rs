@@ -6,6 +6,7 @@ use std::sync::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
     Paxmod,
+    Pplx,
     Jev,
     Ocr,
 }
@@ -14,6 +15,7 @@ impl Provider {
     pub fn name(self) -> &'static str {
         match self {
             Provider::Paxmod => "paxmod",
+            Provider::Pplx => "pplx",
             Provider::Jev => "jev",
             Provider::Ocr => "ocr",
         }

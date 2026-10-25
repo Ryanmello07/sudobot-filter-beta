@@ -16,7 +16,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use sudobot_chat_guard::budget::Budget;
-use sudobot_chat_guard::config::{Config, Env};
+use sudobot_chat_guard::config::{load_policy, Config, Env};
 use sudobot_chat_guard::model::*;
 use sudobot_chat_guard::pipeline::{Budgets, Deps, IncomingMessage, Pipeline};
 use sudobot_chat_guard::ports::*;
@@ -142,27 +142,30 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::load(&std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".into()))?);
     let big = || Arc::new(Budget::new(u64::MAX / 4, 0.0));
     let offline = Arc::new(Offline);
-    let (pax, jev): (Arc<dyn TextModerator>, Arc<dyn Classifier>) = if local_only {
-        (offline.clone(), offline.clone())
+    let (pax, pplx, jev): (Arc<dyn TextModerator>, Arc<dyn Classifier>, Arc<dyn Classifier>) = if local_only {
+        (offline.clone(), offline.clone(), offline.clone())
     } else {
         std::env::set_var("DISCORD_TOKEN", std::env::var("DISCORD_TOKEN").unwrap_or_else(|_| "unused".into()));
         let env = Env::from_env()?;
         let t = std::time::Duration::from_millis(env.provider_timeout_ms);
+        let policy = load_policy(&env.policy_file);
         (
             Arc::new(PaxmodClient::new(&env.paxmod_base, env.paxmod_key.clone(), t)),
-            Arc::new(PpqClient::new(&env.typesafe_base, env.typesafe_key.clone(), &env.jev_model, None, t)),
+            Arc::new(PpqClient::new(&env.ppq_base, env.ppq_key.clone(), &env.pplx_model, policy.clone(), t)),
+            Arc::new(PpqClient::new(&env.ppq_base, env.ppq_key.clone(), &env.jev_model, policy, t)),
         )
     };
     let pipeline = Pipeline::new(Deps {
         cfg,
         store: Store::memory().await?,
         paxmod: pax,
+        pplx,
         jev,
         ocr: offline.clone(),
         fetcher: offline.clone(),
         sink: offline.clone(),
         modlog: offline.clone(),
-        budgets: Budgets { paxmod: big(), jev: big(), ocr: big() },
+        budgets: Budgets { paxmod: big(), pplx: big(), jev: big(), ocr: big() },
         ocr_max_upload: 1_000_000,
         roll: Arc::new(rand::random::<f64>),
     });

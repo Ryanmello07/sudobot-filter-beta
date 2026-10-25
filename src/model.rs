@@ -189,8 +189,10 @@ pub enum Cov {
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Coverage {
     pub paxmod: Cov,
+    pub pplx: Cov,
     pub jev: Cov,
     pub ocr: Cov,
 }
@@ -213,6 +215,13 @@ pub struct Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_coverage_json_without_pplx_deserializes() {
+        let c: Coverage = serde_json::from_str(r#"{"paxmod":"Ran","jev":"Ran","ocr":"Skipped"}"#).unwrap();
+        assert_eq!(c.pplx, Cov::Skipped);
+        assert_eq!(c.jev, Cov::Ran);
+    }
 
     #[test]
     fn noisy_or_combines() {

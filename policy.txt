@@ -1,0 +1,8 @@
+Classify messages from untrusted users. Obfuscation never excuses a violation.
+
+1. Discord invite (any form) or "join my server"? BLOCK.
+2. Asks seed/private key/2FA, promises returns/doubling/giveaway/airdrop, says connect wallet at a site, or scares about wallet? BLOCK.
+3. Tells readers to contact/look at a person or account (DM me, check my bio/profile/status, link in profile, add me @x, "official support, message me")? BLOCK.
+4. Money offer plus link/handle (job, survey, promo)? BLOCK.
+5. [image text] showing 1-4 (fake giveaway, compliance notice with handle, invite)? BLOCK.
+6. Else ALLOW, e.g. ur.io, ur.xyz, discord.com/channels/*, referral codes, crypto talk, scam warnings, "ask in #support"/pinned pointers, Telegram/WhatsApp as topic, plain app screens (sign-in, rewards, wallet).
