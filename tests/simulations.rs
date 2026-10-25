@@ -109,6 +109,7 @@ struct Sim {
     p: Pipeline,
     log: Arc<Log>,
     paxmod_budget: Arc<Budget>,
+    pplx_budget: Arc<Budget>,
     jev_budget: Arc<Budget>,
     ocr_budget: Arc<Budget>,
 }
@@ -145,7 +146,7 @@ async fn sim(
         ocr_max_upload: 1_000_000,
         roll: Arc::new(|| 0.99),
     });
-    Sim { p, log, paxmod_budget: pb, jev_budget: jb, ocr_budget: ob }
+    Sim { p, log, paxmod_budget: pb, pplx_budget: xb, jev_budget: jb, ocr_budget: ob }
 }
 
 /// Quarantine tier: 2h-old account, 3 minutes in the guild.
@@ -214,18 +215,22 @@ async fn outage_all_providers_fails_open_breakers_open_announced_once() {
         assert_eq!(v.label, Label::Spam);
         if i < 5 {
             assert_eq!(v.coverage.paxmod, Cov::Failed, "message {i}");
+            assert_eq!(v.coverage.pplx, Cov::Failed, "message {i}");
             assert_eq!(v.coverage.jev, Cov::Failed, "message {i}");
         } else {
             // Breaker open: no further HTTP calls, coverage reports Skipped.
             assert_eq!(v.coverage.paxmod, Cov::Skipped, "message {i}");
+            assert_eq!(v.coverage.pplx, Cov::Skipped, "message {i}");
             assert_eq!(v.coverage.jev, Cov::Skipped, "message {i}");
         }
     }
     assert!(sim.paxmod_budget.breaker_open());
+    assert!(sim.pplx_budget.breaker_open());
     assert!(sim.jev_budget.breaker_open());
     assert!(sim.ocr_budget.breaker_open());
     // Exactly one degradation announcement per provider per day.
     assert_eq!(notices_containing(&sim.log, "Paxmod is failing repeatedly"), 1);
+    assert_eq!(notices_containing(&sim.log, "Perplexity is failing repeatedly"), 1);
     assert_eq!(notices_containing(&sim.log, "Jev is failing repeatedly"), 1);
     assert_eq!(notices_containing(&sim.log, "OCR is failing repeatedly"), 1);
 }

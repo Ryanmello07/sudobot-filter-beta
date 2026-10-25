@@ -100,11 +100,36 @@ pub struct Pipeline {
     tracker: RecentTracker,
     activity: Activity,
     jev_cache: TtlCache<String, JevResult>,
+    pplx_cache: TtlCache<String, JevResult>,
     ocr_cache: TtlCache<String, String>,
     /// Per-guild effective config (static + DB override); short TTL, invalidated on write.
     cfg_cache: TtlCache<u64, Arc<GuildConfig>>,
     announced: Mutex<HashSet<(&'static str, &'static str, NaiveDate)>>,
     feed_tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// The two ppq decision models share one call path.
+#[derive(Clone, Copy)]
+enum Model {
+    Jev,
+    Pplx,
+}
+
+impl Model {
+    /// Name shown in breaker and cap announcements.
+    fn label(self) -> &'static str {
+        match self {
+            Model::Jev => "Jev",
+            Model::Pplx => "Perplexity",
+        }
+    }
+    /// Usage row, announcement key and failure prefix.
+    fn usage(self) -> &'static str {
+        match self {
+            Model::Jev => "jev",
+            Model::Pplx => "pplx",
+        }
+    }
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -142,6 +167,7 @@ impl Pipeline {
             tracker: RecentTracker::default(),
             activity: Activity::default(),
             jev_cache: TtlCache::new(jev_ttl, 4096),
+            pplx_cache: TtlCache::new(jev_ttl, 4096),
             ocr_cache: TtlCache::new(ocr_ttl, 4096),
             cfg_cache: TtlCache::new(std::time::Duration::from_secs(30), 256),
             announced: Mutex::new(HashSet::new()),
@@ -309,29 +335,35 @@ impl Pipeline {
         let combined = if ocr_text.is_empty() { m.content.clone() } else { format!("{}\n[image text] {}", m.content, ocr_text) };
         let combined = trunc(&combined, 5000);
         let mut pax: Option<PaxmodResult> = None;
+        let mut pplx: Option<JevResult> = None;
         let mut jev: Option<JevResult> = None;
         if plan.providers && !combined.trim().is_empty() {
             let state = self.jev_state(&m, &profile, &ocr_text, &recent, now);
-            // The Jev cache key carries author context (tier + account-age bucket in
+            // The model cache keys carry author context (tier + account-age bucket in
             // hours) so a verdict for a brand-new account is never reused for an
             // established one posting the same text.
-            let jev_ctx = format!("{}:{}", tier.name(), (now - m.profile.account_created).num_hours());
-            let (p, j) = tokio::join!(
+            let model_ctx = format!("{}:{}", tier.name(), (now - m.profile.account_created).num_hours());
+            let (p, x, j) = tokio::join!(
                 self.run_paxmod(&m, &combined, prio, now, &mut failures),
-                self.run_jev(g, &combined, state, prio, now, &jev_ctx)
+                self.run_classifier(Model::Pplx, g, &combined, state.clone(), Ask::Message, prio, now, &model_ctx),
+                self.run_classifier(Model::Jev, g, &combined, state, Ask::Message, prio, now, &model_ctx)
             );
             let (pr, pc) = p;
+            let (xr, xc, xf) = x;
             let (jr, jc, jf) = j;
             pax = pr;
+            pplx = xr;
             jev = jr;
             coverage.paxmod = pc;
+            coverage.pplx = xc;
             coverage.jev = jc;
+            failures.extend(xf);
             failures.extend(jf);
         }
 
         // ---- fuse + decide ----
         let verdict = fuse(
-            &Inputs { local: Some(&local), paxmod: pax.as_ref(), pplx: None, jev: jev.as_ref(), coverage },
+            &Inputs { local: Some(&local), paxmod: pax.as_ref(), pplx: pplx.as_ref(), jev: jev.as_ref(), coverage },
             &gc.fusion,
             flag_threshold(tier, &gc.ladder),
             report_cap(tier, &gc.ladder),
@@ -383,6 +415,7 @@ impl Pipeline {
                 local_signals: serde_json::to_string(&local.signals).unwrap_or_default(),
                 paxmod_json: pax.as_ref().and_then(|p| serde_json::to_string(p).ok()),
                 jev_json: jev.as_ref().and_then(|j| serde_json::to_string(j).ok()),
+                pplx_json: pplx.as_ref().and_then(|j| serde_json::to_string(j).ok()),
                 ocr_json: (!ocr_text.is_empty()).then(|| serde_json::json!({"text": trunc(&ocr_text, 500)}).to_string()),
                 verdict_json: serde_json::to_string(&verdict).unwrap_or_default(),
                 action_planned: planned.name().into(),
@@ -431,7 +464,7 @@ impl Pipeline {
                 self.d.modlog.incident(&report).await;
             }
         } else if verdict.label == Label::Clean
-            && (matches!(verdict.coverage.paxmod, Cov::Ran | Cov::Degraded) || verdict.coverage.jev == Cov::Ran)
+            && (matches!(verdict.coverage.paxmod, Cov::Ran | Cov::Degraded) || verdict.coverage.pplx == Cov::Ran || verdict.coverage.jev == Cov::Ran)
         {
             if let Err(e) = self.d.store.note_clean_scan(g, m.author_id).await {
                 tracing::warn!("note_clean_scan failed: {e}");
@@ -517,29 +550,34 @@ impl Pipeline {
     /// `cache_ctx` binds the cache entry to the author's trust context (tier and
     /// account-age bucket), so identical text from different author contexts costs
     /// separate calls and cannot share a verdict.
-    async fn run_jev(&self, guild: u64, text: &str, state: JevState, prio: Priority, now: DateTime<Utc>, cache_ctx: &str) -> (Option<JevResult>, Cov, Vec<String>) {
+    #[allow(clippy::too_many_arguments)]
+    async fn run_classifier(&self, model: Model, guild: u64, text: &str, state: JevState, ask: Ask, prio: Priority, now: DateTime<Utc>, cache_ctx: &str) -> (Option<JevResult>, Cov, Vec<String>) {
+        let (dep, budget, cache) = match model {
+            Model::Jev => (&self.d.jev, &self.d.budgets.jev, &self.jev_cache),
+            Model::Pplx => (&self.d.pplx, &self.d.budgets.pplx, &self.pplx_cache),
+        };
         let key = hash_text(&format!("{cache_ctx}\n{}", normalize(text)));
-        if let Some(hit) = self.jev_cache.get(&key) {
+        if let Some(hit) = cache.get(&key) {
             return (Some(hit), Cov::Ran, vec![]);
         }
-        let g: Guarded<JevResult> = guarded(&self.d.budgets.jev, prio, now, || self.d.jev.assess(&state, Ask::Message)).await;
-        self.on_event(guild, "Jev", g.event).await;
+        let g: Guarded<JevResult> = guarded(budget, prio, now, || dep.assess(&state, ask)).await;
+        self.on_event(guild, model.label(), g.event).await;
         if g.called {
-            let _ = self.d.store.record_usage("jev", 1, g.result.is_err() as i64, now).await;
+            let _ = self.d.store.record_usage(model.usage(), 1, g.result.is_err() as i64, now).await;
         }
         match g.result {
             Ok(r) => {
-                self.jev_cache.put(key, r.clone());
+                cache.put(key, r.clone());
                 (Some(r), Cov::Ran, vec![])
             }
             Err(GuardErr::Denied(Denied::OverCap)) => {
-                self.announce_once(guild, "jev", "cap", now, "Jev daily call cap reached; its checks are paused until tomorrow (UTC).".into()).await;
-                (None, Cov::Skipped, vec!["jev: over cap".into()])
+                self.announce_once(guild, model.usage(), "cap", now, format!("{} daily call cap reached; its checks are paused until tomorrow (UTC).", model.label())).await;
+                (None, Cov::Skipped, vec![format!("{}: over cap", model.usage())])
             }
-            Err(GuardErr::Denied(Denied::CircuitOpen)) => (None, Cov::Skipped, vec!["jev: circuit open".into()]),
+            Err(GuardErr::Denied(Denied::CircuitOpen)) => (None, Cov::Skipped, vec![format!("{}: circuit open", model.usage())]),
             Err(GuardErr::Provider(e)) => {
-                tracing::warn!("jev failed: {e}");
-                (None, Cov::Failed, vec![format!("jev: {e}")])
+                tracing::warn!("{} failed: {e}", model.usage());
+                (None, Cov::Failed, vec![format!("{}: {e}", model.usage())])
             }
         }
     }
@@ -981,7 +1019,6 @@ mod tests {
     struct H {
         p: Pipeline,
         pax: Arc<FakePax>,
-        #[allow(dead_code)] // asserted on once the pipeline calls Perplexity
         pplx: Arc<FakeJev>,
         jev: Arc<FakeJev>,
         ocr: Arc<FakeOcr>,
@@ -1152,6 +1189,161 @@ mod tests {
         let o = h.p.handle(msg(1, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert!(o.verdict.as_ref().unwrap().corroborated);
         assert!(h.sink.has("delete 50 1") && h.sink.has("timeout 7 60"), "log: {:?}", h.sink.log.lock().unwrap());
+    }
+
+    // ---------- Perplexity + Jev on every scanned message ----------
+
+    /// Quarantine member, enforce mode: the setup the brief's scenarios share.
+    async fn run3(pax: Arc<FakePax>, pplx: Arc<FakeJev>, jev: Arc<FakeJev>, text: &str) -> (H, Outcome) {
+        let h = harness_full(Config::default(), pax, pplx, jev, true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(1, 7, text, new_user(7)), Utc::now()).await;
+        (h, o)
+    }
+
+    fn pplx_down() -> Arc<FakeJev> {
+        FakeJev::new(Err(ProviderError::Server(503)))
+    }
+
+    #[tokio::test]
+    async fn both_models_called_once_per_scanned_message() {
+        let (h, o) = run3(FakePax::spam(0.0), FakeJev::clean(), FakeJev::clean(), "hello there").await;
+        assert_eq!((h.pax.n(), h.pplx.n(), h.jev.n()), (1, 1, 1));
+        let v = o.verdict.unwrap();
+        assert_eq!((v.coverage.paxmod, v.coverage.pplx, v.coverage.jev), (Cov::Ran, Cov::Ran, Cov::Ran));
+    }
+
+    #[tokio::test]
+    async fn paxmod_down_pplx_acts_with_jev_corroboration() {
+        let (h, o) = run3(FakePax::failing(), FakeJev::spam(), FakeJev::spam(), "hello there").await;
+        assert_eq!(o.taken, "delete+timeout");
+        assert!(h.sink.has("delete 50 1") && h.sink.has("timeout 7 60"), "log: {:?}", h.sink.log.lock().unwrap());
+        let v = o.verdict.unwrap();
+        assert!(v.corroborated);
+        assert_eq!((v.coverage.paxmod, v.coverage.pplx, v.coverage.jev), (Cov::Failed, Cov::Ran, Cov::Ran));
+        let row = h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap();
+        assert_eq!(row.action_taken, "delete+timeout");
+        // fallback timeout reason uses the "<label> <score>" form
+        let want = format!("timeout 7 60 | Automated Temporary Mute: {} {:.2}", v.label.name(), v.score);
+        assert!(h.sink.has(&want), "log: {:?}", h.sink.log.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paxmod_down_pplx_spam_jev_clean_flags_only() {
+        let (h, o) = run3(FakePax::failing(), FakeJev::spam(), FakeJev::clean(), "hello there").await;
+        assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+        assert_eq!((o.planned, o.taken.as_str()), (Action::Flag, "flag"));
+        let v = o.verdict.unwrap();
+        assert!(!v.corroborated);
+        assert!(v.evidence.iter().any(|e| e == "note: no second source agreed; flag only"));
+        assert_eq!(h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap().action_taken, "flag");
+    }
+
+    #[tokio::test]
+    async fn paxmod_down_pplx_clean_jev_spam_flags_only() {
+        let (h, o) = run3(FakePax::failing(), FakeJev::clean(), FakeJev::spam(), "hello there").await;
+        assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+        assert_eq!(o.taken, "flag");
+        assert_eq!(h.p.store().incident(o.incident_id.unwrap()).await.unwrap().unwrap().action_taken, "flag");
+    }
+
+    #[tokio::test]
+    async fn paxmod_and_pplx_down_jev_alone_flags_only_unless_local_corroborates() {
+        for pplx in [pplx_down(), FakeJev::new(Err(ProviderError::Quota))] {
+            let (h, o) = run3(FakePax::failing(), pplx, FakeJev::spam(), "hello there").await;
+            assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+            assert_eq!(o.taken, "flag");
+            assert_eq!(o.verdict.unwrap().coverage.pplx, Cov::Failed);
+        }
+        // Jev is the third source: with a strong local rule (mass mention, 0.7) it may act.
+        let h = harness_full(Config::default(), FakePax::failing(), pplx_down(), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
+        let mut m = msg(2, 7, "hi", new_user(7));
+        m.distinct_mentions = 12;
+        let o = h.p.handle(m, Utc::now()).await;
+        assert!(o.verdict.as_ref().unwrap().corroborated);
+        assert!(o.planned > Action::Flag && h.sink.has("delete 50 2"), "log: {:?}", h.sink.log.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paxmod_responds_models_block_never_acts() {
+        // Paxmod answers clean; both models say block at full confidence; a local rule fires.
+        let promo = || {
+            FakeJev::new(Ok(JevResult {
+                class: "promo_solicitation".into(),
+                class_probs: [("promo_solicitation".to_string(), 1.0), ("legitimate".to_string(), 0.0)].into(),
+                class_confidence: 1.0,
+                ..Default::default()
+            }))
+        };
+        let h = harness_full(Config::default(), FakePax::spam(0.0), promo(), promo(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(78, 7, "i would get the 4070, see https://example.com/review for benchmarks", new_user(7)), Utc::now()).await;
+        let v = o.verdict.as_ref().unwrap();
+        assert!(v.evidence.iter().any(|e| e.starts_with("rule:first_message_link")), "{:?}", v.evidence);
+        assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+        assert!(matches!(o.taken.as_str(), "none" | "flag"), "{}", o.taken);
+
+        // Same with a strong local rule (mass mention): still capped below the action rungs.
+        let h = harness_full(Config::default(), FakePax::spam(0.0), promo(), promo(), true, 0.99, FakeSink::default()).await;
+        let mut m = msg(79, 7, "hi", new_user(7));
+        m.distinct_mentions = 12;
+        let o = h.p.handle(m, Utc::now()).await;
+        assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+        assert_eq!(o.planned, Action::Flag, "score {}", o.verdict.as_ref().unwrap().score);
+        assert_eq!(o.taken, "flag");
+    }
+
+    #[tokio::test]
+    async fn pplx_results_are_cached_for_crossposted_text() {
+        let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        h.p.handle(msg(1, 7, "check this out", new_user(7)), Utc::now()).await;
+        h.p.handle(msg(2, 8, "Check  this   OUT", new_user(8)), Utc::now()).await;
+        assert_eq!(h.pplx.n(), 1);
+        assert_eq!(h.jev.n(), 1);
+        assert_eq!(h.pax.n(), 2, "Paxmod must see every message and author");
+        // a different author context (older account) does not share the entry
+        h.p.handle(msg(3, 9, "check this out", profile(9, 20, 3)), Utc::now()).await;
+        assert_eq!(h.pplx.n(), 2);
+    }
+
+    #[tokio::test]
+    async fn coverage_reports_pplx() {
+        let (_h, o) = run3(FakePax::spam(0.0), FakeJev::clean(), FakeJev::clean(), "hello there").await;
+        assert_eq!(o.verdict.unwrap().coverage.pplx, Cov::Ran);
+        let (h, o) = run3(FakePax::spam(0.0), pplx_down(), FakeJev::clean(), "hello there").await;
+        let v = o.verdict.unwrap();
+        assert_eq!((v.coverage.pplx, v.coverage.jev), (Cov::Failed, Cov::Ran));
+        assert_eq!(h.p.store().usage_today("pplx", Utc::now()).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn pplx_failing_while_paxmod_responds_changes_nothing() {
+        let (h, o) = run3(FakePax::spam(0.8), pplx_down(), FakeJev::spam(), "buy cheap stuff now").await;
+        assert_eq!(o.taken, "delete+timeout");
+        assert!(h.sink.has("timeout 7 60"));
+    }
+
+    #[tokio::test]
+    async fn pplx_over_cap_is_skipped_and_announced_once() {
+        let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
+        h.p.d.budgets.pplx.preload(1000);
+        for i in 0..3 {
+            let o = h.p.handle(msg(i, 7, "hello", new_user(7)), Utc::now()).await;
+            assert_eq!(o.verdict.unwrap().coverage.pplx, Cov::Skipped);
+        }
+        assert_eq!(h.pplx.n(), 0);
+        assert_eq!(h.jev.n(), 1, "Jev unaffected by Perplexity's cap");
+        let n = |needle: &str| h.log.notices.lock().unwrap().iter().filter(|t| t.contains(needle)).count();
+        assert_eq!(n("Perplexity daily call cap"), 1);
+        assert_eq!(n("Jev daily call cap"), 0);
+    }
+
+    #[tokio::test]
+    async fn incident_stores_pplx_json_only_when_perplexity_answered() {
+        let (h, o) = run3(FakePax::spam(0.9), FakeJev::spam(), FakeJev::clean(), "hello there").await;
+        let json = h.p.store().pplx_json_for(o.incident_id.unwrap()).await.expect("pplx_json stored");
+        let r: JevResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(r.class, "spam");
+        let (h, o) = run3(FakePax::spam(0.9), pplx_down(), FakeJev::spam(), "hello there").await;
+        assert_eq!(h.p.store().pplx_json_for(o.incident_id.unwrap()).await, None);
     }
 
     #[test]
@@ -1336,7 +1528,7 @@ mod tests {
         let o = h.p.handle(msg(1, 8, "hello everyone, nice weather", old_user(8)), Utc::now()).await;
         assert_eq!(o.tier, Tier::Established);
         assert_eq!(o.plan, Plan::NONE);
-        assert_eq!((h.pax.n(), h.jev.n()), (0, 0));
+        assert_eq!((h.pax.n(), h.pplx.n(), h.jev.n()), (0, 0, 0));
         assert_eq!(o.taken, "none");
     }
 
@@ -1362,10 +1554,12 @@ mod tests {
 
     #[tokio::test]
     async fn both_providers_down_fails_open_to_local_rules() {
-        let h = harness(FakePax::failing(), FakeJev::new(Err(ProviderError::Timeout)), true, 0.99, FakeSink::default()).await;
+        let down = || FakeJev::new(Err(ProviderError::Timeout));
+        let h = harness_full(Config::default(), FakePax::failing(), down(), down(), true, 0.99, FakeSink::default()).await;
         let o = h.p.handle(msg(1, 7, "just chatting here", new_user(7)), Utc::now()).await;
         let v = o.verdict.unwrap();
         assert_eq!(v.coverage.paxmod, Cov::Failed);
+        assert_eq!(v.coverage.pplx, Cov::Failed);
         assert_eq!(v.coverage.jev, Cov::Failed);
         assert_eq!(o.taken, "none");
         // local rules still work when providers are down: blocked shortener on first message
@@ -1480,7 +1674,7 @@ mod tests {
         h.p.drain_feed().await;
         assert_eq!(o.plan, Plan::NONE);
         assert_eq!(h.pax.n(), before + 1);
-        assert_eq!(h.jev.n(), 1, "feed goes to Paxmod only");
+        assert_eq!((h.pplx.n(), h.jev.n()), (1, 1), "feed goes to Paxmod only");
         // a different, quiet channel is not fed
         let mut other = msg(3, 8, "completely different words here", old_user(8));
         other.channel_id = 99;
@@ -1530,7 +1724,7 @@ mod tests {
         let h = harness(FakePax::spam(0.0), FakeJev::clean(), false, 0.99, FakeSink::default()).await;
         seed_clean(&h, 8).await; // earn Established so the member is fed, not scanned
         let now = Utc::now();
-        // quarantine member speaks: scanned (paxmod 1, jev 1), opens the feed window
+        // quarantine member speaks: scanned (paxmod 1, pplx 1, jev 1), opens the feed window
         h.p.handle(msg(1, 7, "hello", new_user(7)), now).await;
         // established member in the same channel: context-fed to Paxmod only
         h.p.handle(msg(2, 8, "hi there friend", old_user(8)), now).await;
@@ -1539,6 +1733,7 @@ mod tests {
         h.p.handle_join(JoinEvent { guild_id: 1, user_id: 9, username: "alice".into(), display_name: "a".into(), profile: old_user(9) }, now).await;
         assert_eq!(h.p.store().usage_today("paxmod", now).await.0, 3, "scan + feed + join screening");
         assert_eq!(h.p.store().usage_today("jev", now).await.0, 2, "scan + join screening");
+        assert_eq!(h.p.store().usage_today("pplx", now).await.0, 1, "scan only until join screening uses Perplexity");
     }
 
     #[tokio::test]
@@ -1594,5 +1789,6 @@ mod tests {
         h.p.handle(msg(1, 7, "check this out", profile(7, 2, 3)), Utc::now()).await; // 2h-old account
         h.p.handle(msg(2, 8, "check this out", profile(8, 20, 3)), Utc::now()).await; // 20h-old account
         assert_eq!(h.jev.n(), 2, "identical text from different author contexts must not share a Jev cache entry");
+        assert_eq!(h.pplx.n(), 2, "nor a Perplexity cache entry");
     }
 }

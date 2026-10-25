@@ -48,6 +48,7 @@ pub struct NewIncident {
     pub local_signals: String,
     pub paxmod_json: Option<String>,
     pub jev_json: Option<String>,
+    pub pplx_json: Option<String>,
     pub ocr_json: Option<String>,
     pub verdict_json: String,
     pub action_planned: String,
@@ -381,10 +382,10 @@ impl Store {
 
     pub async fn insert_incident(&self, i: &NewIncident, now: DateTime<Utc>) -> anyhow::Result<i64> {
         let r = sqlx::query(
-            "INSERT INTO incidents (guild_id,user_id,channel_id,message_id,tier,label,score,local_signals,paxmod_json,jev_json,ocr_json,verdict_json,action_planned,action_taken,outcome,text_excerpt,created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            "INSERT INTO incidents (guild_id,user_id,channel_id,message_id,tier,label,score,local_signals,paxmod_json,jev_json,pplx_json,ocr_json,verdict_json,action_planned,action_taken,outcome,text_excerpt,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(guild_id, message_id) DO UPDATE SET tier=excluded.tier, label=excluded.label, score=excluded.score,
-               local_signals=excluded.local_signals, paxmod_json=excluded.paxmod_json, jev_json=excluded.jev_json, ocr_json=excluded.ocr_json,
+               local_signals=excluded.local_signals, paxmod_json=excluded.paxmod_json, jev_json=excluded.jev_json, pplx_json=excluded.pplx_json, ocr_json=excluded.ocr_json,
                verdict_json=excluded.verdict_json, action_planned=excluded.action_planned, action_taken=excluded.action_taken,
                outcome=excluded.outcome, text_excerpt=excluded.text_excerpt
              RETURNING id",
@@ -399,6 +400,7 @@ impl Store {
         .bind(&i.local_signals)
         .bind(&i.paxmod_json)
         .bind(&i.jev_json)
+        .bind(&i.pplx_json)
         .bind(&i.ocr_json)
         .bind(&i.verdict_json)
         .bind(&i.action_planned)
@@ -409,6 +411,11 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(r.get("id"))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pplx_json_for(&self, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT pplx_json FROM incidents WHERE id = ?").bind(id).fetch_one(&self.pool).await.unwrap()
     }
 
     pub async fn incident(&self, id: i64) -> anyhow::Result<Option<IncidentRow>> {
@@ -644,6 +651,29 @@ mod tests {
         assert_eq!(s.incident(a).await.unwrap().unwrap().outcome, "undone");
         s.prune(14, t + Duration::days(15)).await.unwrap();
         assert!(s.incident(a).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn incident_persists_pplx_json() {
+        let s = Store::memory().await.unwrap();
+        let t = now();
+        let mut i = NewIncident { guild_id: 1, user_id: 2, channel_id: 3, message_id: 4, tier: "fresh".into(), label: "spam".into(), score: 0.8, action_planned: "flag".into(), action_taken: "flag".into(), outcome: "open".into(), verdict_json: "{}".into(), local_signals: "[]".into(), pplx_json: Some("{}".into()), ..Default::default() };
+        let id = s.insert_incident(&i, t).await.unwrap();
+        let col = |s: &Store| {
+            let pool = s.pool.clone();
+            async move { sqlx::query_scalar::<_, Option<String>>("SELECT pplx_json FROM incidents WHERE id = ?").bind(id).fetch_one(&pool).await.unwrap() }
+        };
+        assert_eq!(col(&s).await.as_deref(), Some("{}"));
+        // the upsert path rewrites it too
+        i.pplx_json = Some("{\"class\":\"spam\"}".into());
+        assert_eq!(s.insert_incident(&i, t).await.unwrap(), id);
+        assert_eq!(col(&s).await.as_deref(), Some("{\"class\":\"spam\"}"));
+        // absent stays NULL
+        i.message_id = 5;
+        i.pplx_json = None;
+        let id2 = s.insert_incident(&i, t).await.unwrap();
+        let v = sqlx::query_scalar::<_, Option<String>>("SELECT pplx_json FROM incidents WHERE id = ?").bind(id2).fetch_one(&s.pool).await.unwrap();
+        assert_eq!(v, None);
     }
 
     #[tokio::test]

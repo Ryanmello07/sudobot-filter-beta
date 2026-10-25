@@ -196,7 +196,7 @@ mod tests {
             observe,
             account_age_days: 1604,
             minutes_in_guild: Some(82553),
-            coverage: "Coverage { paxmod: Ran, jev: Ran, ocr: Skipped }".into(),
+            coverage: "Coverage { paxmod: Ran, pplx: Ran, jev: Ran, ocr: Skipped }".into(),
             evidence: vec!["rule:blocked_domain (0.80)".into()],
             excerpt: "free nitro at evil.com".into(),
             image_text: None,
