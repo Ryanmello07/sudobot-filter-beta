@@ -1,7 +1,7 @@
 //! Traits at the edges, so the pipeline can be tested with fakes.
 
 use crate::model::{JevResult, PaxmodResult};
-use crate::providers::jev::{JevClient, JevState};
+use crate::providers::jev::{Ask, JevState, PpqClient};
 use crate::providers::ocr::OcrClient;
 use crate::providers::paxmod::PaxmodClient;
 use crate::providers::ProviderError;
@@ -14,7 +14,7 @@ pub trait TextModerator: Send + Sync {
 
 #[async_trait]
 pub trait Classifier: Send + Sync {
-    async fn assess(&self, state: &JevState) -> Result<JevResult, ProviderError>;
+    async fn assess(&self, state: &JevState, ask: Ask) -> Result<JevResult, ProviderError>;
 }
 
 #[async_trait]
@@ -30,9 +30,9 @@ impl TextModerator for PaxmodClient {
 }
 
 #[async_trait]
-impl Classifier for JevClient {
-    async fn assess(&self, state: &JevState) -> Result<JevResult, ProviderError> {
-        JevClient::assess(self, state).await
+impl Classifier for PpqClient {
+    async fn assess(&self, state: &JevState, ask: Ask) -> Result<JevResult, ProviderError> {
+        PpqClient::assess(self, state, ask).await
     }
 }
 

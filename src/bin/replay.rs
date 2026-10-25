@@ -20,7 +20,7 @@ use sudobot_chat_guard::config::{Config, Env};
 use sudobot_chat_guard::model::*;
 use sudobot_chat_guard::pipeline::{Budgets, Deps, IncomingMessage, Pipeline};
 use sudobot_chat_guard::ports::*;
-use sudobot_chat_guard::providers::jev::{JevClient, JevState};
+use sudobot_chat_guard::providers::jev::{Ask, JevState, PpqClient};
 use sudobot_chat_guard::providers::paxmod::PaxmodClient;
 use sudobot_chat_guard::providers::ProviderError;
 use sudobot_chat_guard::store::Store;
@@ -51,7 +51,7 @@ impl TextModerator for Offline {
 }
 #[async_trait]
 impl Classifier for Offline {
-    async fn assess(&self, _: &JevState) -> Result<JevResult, ProviderError> {
+    async fn assess(&self, _: &JevState, _: Ask) -> Result<JevResult, ProviderError> {
         Err(ProviderError::Rejected(0, "offline".into()))
     }
 }
@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         let t = std::time::Duration::from_millis(env.provider_timeout_ms);
         (
             Arc::new(PaxmodClient::new(&env.paxmod_base, env.paxmod_key.clone(), t)),
-            Arc::new(JevClient::new(&env.typesafe_base, env.typesafe_key.clone(), &env.jev_model, t)),
+            Arc::new(PpqClient::new(&env.typesafe_base, env.typesafe_key.clone(), &env.jev_model, None, t)),
         )
     };
     let pipeline = Pipeline::new(Deps {

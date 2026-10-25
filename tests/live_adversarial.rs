@@ -20,7 +20,7 @@ use std::sync::Once;
 use std::time::Duration;
 use sudobot_chat_guard::config::Env;
 use sudobot_chat_guard::fusion::{jev_risks, paxmod_risks};
-use sudobot_chat_guard::providers::jev::{JevClient, JevState};
+use sudobot_chat_guard::providers::jev::{Ask, JevState, PpqClient};
 use sudobot_chat_guard::providers::paxmod::PaxmodClient;
 
 const CORPUS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/adversarial-corpus.jsonl");
@@ -101,7 +101,7 @@ async fn live_adversarial_corpus_detection_rates() {
         PaxmodClient::new(&e.paxmod_base, e.paxmod_key.clone(), Duration::from_millis(e.provider_timeout_ms.max(10_000)))
     });
     let jev = (!e.typesafe_key.is_empty()).then(|| {
-        JevClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, Duration::from_millis(e.provider_timeout_ms.max(10_000)))
+        PpqClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)))
     });
     if pax.is_none() && jev.is_none() {
         return println!("SKIP: no provider keys set; fill .env to run the adversarial corpus");
@@ -143,7 +143,7 @@ async fn live_adversarial_corpus_detection_rates() {
             }
             calls_made += 1;
             let r = j
-                .assess(&JevState { message: s.text.clone(), ..Default::default() })
+                .assess(&JevState { message: s.text.clone(), ..Default::default() }, Ask::Message)
                 .await
                 .unwrap_or_else(|e| panic!("jev failed to give a parseable response for {:?}: {e}", s.text));
             for v in r.class_probs.values() {

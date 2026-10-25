@@ -9,7 +9,7 @@ use sudobot_chat_guard::discord::handler::{Handler, State};
 use sudobot_chat_guard::discord::modlog::DiscordModLog;
 use sudobot_chat_guard::pipeline::{Budgets, Deps, Pipeline};
 use sudobot_chat_guard::ports::HttpImageFetcher;
-use sudobot_chat_guard::providers::{jev::JevClient, ocr::OcrClient, paxmod::PaxmodClient};
+use sudobot_chat_guard::providers::{jev::PpqClient, ocr::OcrClient, paxmod::PaxmodClient};
 use sudobot_chat_guard::store::Store;
 
 fn warn_if_placeholder(name: &str, v: &sudobot_chat_guard::secret::Secret) {
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
         cfg: cfg.clone(),
         store: store.clone(),
         paxmod: Arc::new(PaxmodClient::new(&env.paxmod_base, env.paxmod_key.clone(), timeout)),
-        jev: Arc::new(JevClient::new(&env.typesafe_base, env.typesafe_key.clone(), &env.jev_model, timeout)),
+        jev: Arc::new(PpqClient::new(&env.typesafe_base, env.typesafe_key.clone(), &env.jev_model, None, timeout)),
         ocr: Arc::new(OcrClient::new(&env.ocr_base, env.ocr_key.clone(), env.ocr_engine, Duration::from_millis(env.ocr_timeout_ms))),
         fetcher: Arc::new(HttpImageFetcher::new()),
         sink: Arc::new(DiscordSink { http: client.http.clone(), cache: client.cache.clone() }),

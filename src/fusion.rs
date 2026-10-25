@@ -55,7 +55,11 @@ pub fn jev_risks(j: &JevResult) -> (f64, f64) {
     } else {
         0.0
     };
-    let spam = class_spam.max(0.9 * j.dm_lure.max(j.crypto_giveaway)).max(0.7 * j.evasion).clamp(0.0, 1.0);
+    let spam = class_spam
+        .max(0.9 * j.dm_lure.max(j.crypto_giveaway))
+        .max(0.7 * j.evasion)
+        .max(j.policy_block.unwrap_or(0.0))
+        .clamp(0.0, 1.0);
     // Symmetric fallback: trust the headline class when other_abuse has no probability.
     let abuse = p("other_abuse")
         .unwrap_or(if j.class == "other_abuse" { 1.0 - p_legit } else { 0.0 })
@@ -211,6 +215,17 @@ mod tests {
 
     fn local(score: f64) -> LocalResult {
         LocalResult::from_signals(vec![Signal { name: "x".into(), weight: score }])
+    }
+
+    #[test]
+    fn policy_block_feeds_spam_risk() {
+        let r = JevResult {
+            class: "legitimate".into(),
+            class_probs: [("legitimate".to_string(), 1.0)].into_iter().collect(),
+            policy_block: Some(0.95),
+            ..Default::default()
+        };
+        assert!(jev_risks(&r).0 >= 0.95);
     }
 
     #[test]

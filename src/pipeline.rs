@@ -10,7 +10,7 @@ use crate::model::*;
 use crate::normalize::{contains_url, hash_bytes, hash_text, normalize};
 use crate::policy::{decide, flag_threshold, report_cap};
 use crate::ports::*;
-use crate::providers::jev::JevState;
+use crate::providers::jev::{Ask, JevState};
 use crate::risk::{compute_tier, detection_plan, graduated, ocr_eligible, Plan, TierHints};
 use crate::rules::{evaluate, image_text_signals, MessageFacts, RecentMsg, RecentTracker};
 use crate::store::{IncidentRow, NewIncident, Store};
@@ -519,7 +519,7 @@ impl Pipeline {
         if let Some(hit) = self.jev_cache.get(&key) {
             return (Some(hit), Cov::Ran, vec![]);
         }
-        let g: Guarded<JevResult> = guarded(&self.d.budgets.jev, prio, now, || self.d.jev.assess(&state)).await;
+        let g: Guarded<JevResult> = guarded(&self.d.budgets.jev, prio, now, || self.d.jev.assess(&state, Ask::Message)).await;
         self.on_event(guild, "Jev", g.event).await;
         if g.called {
             let _ = self.d.store.record_usage("jev", 1, g.result.is_err() as i64, now).await;
@@ -778,7 +778,7 @@ impl Pipeline {
             role_count: j.profile.role_count,
             ..Default::default()
         };
-        let g = guarded(&self.d.budgets.jev, Priority::Low, now_p, || self.d.jev.assess(&state)).await;
+        let g = guarded(&self.d.budgets.jev, Priority::Low, now_p, || self.d.jev.assess(&state, Ask::Name)).await;
         if g.called {
             let _ = self.d.store.record_usage("jev", 1, g.result.is_err() as i64, now).await;
         }
@@ -873,7 +873,7 @@ mod tests {
     }
     #[async_trait]
     impl Classifier for FakeJev {
-        async fn assess(&self, _s: &JevState) -> Result<JevResult, ProviderError> {
+        async fn assess(&self, _s: &JevState, _ask: Ask) -> Result<JevResult, ProviderError> {
             *self.calls.lock().unwrap() += 1;
             let st = self.flip_to_observe.lock().unwrap().clone();
             if let Some(st) = st {

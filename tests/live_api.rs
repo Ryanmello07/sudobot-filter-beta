@@ -15,7 +15,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 use sudobot_chat_guard::config::Env;
 use sudobot_chat_guard::fusion::{jev_risks, paxmod_risks};
-use sudobot_chat_guard::providers::jev::{JevClient, JevState};
+use sudobot_chat_guard::providers::jev::{Ask, JevState, PpqClient};
 use sudobot_chat_guard::providers::ocr::OcrClient;
 use sudobot_chat_guard::providers::paxmod::PaxmodClient;
 
@@ -89,7 +89,7 @@ async fn live_jev_scam_scores_above_benign() {
     if e.typesafe_key.is_empty() {
         return skip("TYPESAFE_API_KEY");
     }
-    let client = JevClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, Duration::from_millis(e.provider_timeout_ms.max(10_000)));
+    let client = PpqClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)));
 
     let scam = JevState {
         message: "FREE NITRO click bit.ly/xxx claim now".into(),
@@ -111,7 +111,7 @@ async fn live_jev_scam_scores_above_benign() {
     let mut spam_risks = Vec::new();
     for st in [&scam, &benign] {
         let t0 = Instant::now();
-        let r = client.assess(st).await.expect("jev request must succeed and parse");
+        let r = client.assess(st, Ask::Message).await.expect("jev request must succeed and parse");
         let latency = t0.elapsed();
         let (spam, abuse) = jev_risks(&r);
         println!(
@@ -180,7 +180,7 @@ async fn live_quality_gate_small_corpus() {
         PaxmodClient::new(&e.paxmod_base, e.paxmod_key.clone(), Duration::from_millis(e.provider_timeout_ms.max(10_000)))
     });
     let jev = (!e.typesafe_key.is_empty()).then(|| {
-        JevClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, Duration::from_millis(e.provider_timeout_ms.max(10_000)))
+        PpqClient::new(&e.typesafe_base, e.typesafe_key.clone(), &e.jev_model, None, Duration::from_millis(e.provider_timeout_ms.max(10_000)))
     });
     if pax.is_none() && jev.is_none() {
         return println!("SKIP: no provider keys set; fill .env to run the quality gate");
@@ -202,7 +202,7 @@ async fn live_quality_gate_small_corpus() {
             }
         }
         if let Some(j) = &jev {
-            match j.assess(&JevState { message: text.into(), ..Default::default() }).await {
+            match j.assess(&JevState { message: text.into(), ..Default::default() }, Ask::Message).await {
                 Ok(r) => {
                     let (s, a) = jev_risks(&r);
                     score = score.max(s.max(a));

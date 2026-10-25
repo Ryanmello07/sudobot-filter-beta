@@ -174,6 +174,9 @@ pub struct JevResult {
     pub crypto_giveaway: f64,
     pub evasion: f64,
     pub bot_like: f64,
+    /// p(block) of the `policy` (message) or `name_bad` (name) answer, when asked.
+    #[serde(default)]
+    pub policy_block: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

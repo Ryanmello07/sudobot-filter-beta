@@ -14,7 +14,7 @@ use sudobot_chat_guard::imaging;
 use sudobot_chat_guard::model::*;
 use sudobot_chat_guard::pipeline::{Budgets, Deps, IncomingMessage, Pipeline};
 use sudobot_chat_guard::ports::*;
-use sudobot_chat_guard::providers::jev::{JevClient, JevState};
+use sudobot_chat_guard::providers::jev::{Ask, JevState, PpqClient};
 use sudobot_chat_guard::providers::ocr::OcrClient;
 use sudobot_chat_guard::providers::paxmod::PaxmodClient;
 use sudobot_chat_guard::providers::ProviderError;
@@ -78,7 +78,7 @@ impl TextModerator for Offline {
 }
 #[async_trait]
 impl Classifier for Offline {
-    async fn assess(&self, _: &JevState) -> Result<JevResult, ProviderError> {
+    async fn assess(&self, _: &JevState, _: Ask) -> Result<JevResult, ProviderError> {
         Err(ProviderError::Rejected(0, "offline".into()))
     }
 }
@@ -191,7 +191,7 @@ async fn outage_all_providers_fails_open_breakers_open_announced_once() {
     let t = std::time::Duration::from_millis(500);
     let sim = sim(
         Arc::new(PaxmodClient::new(&ps.uri(), Secret::new("k"), t)),
-        Arc::new(JevClient::new(&js.uri(), Secret::new("k"), "jev-latest", t)),
+        Arc::new(PpqClient::new(&js.uri(), Secret::new("k"), "jev-latest", None, t)),
         Arc::new(OcrClient::new(&os.uri(), Secret::new("k"), 2, t)),
         Arc::new(PngFetcher(png())),
     )
