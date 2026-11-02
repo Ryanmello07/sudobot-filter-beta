@@ -92,6 +92,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_429_trips_breaker_but_does_not_exhaust_the_day() {
+        // ppq's 429 reaches the pipeline as Server(429): a health failure, never "daily quota spent".
+        let b = Budget::new(100, 0.0);
+        for _ in 0..5 {
+            let g: Guarded<()> = guarded(&b, Priority::High, Utc::now(), || async { Err(ProviderError::Server(429)) }).await;
+            assert!(matches!(g.result, Err(GuardErr::Provider(ProviderError::Server(429)))));
+        }
+        assert!(b.breaker_open(), "repeated 429s open the short breaker");
+        let g: Guarded<()> = guarded(&b, Priority::High, Utc::now(), || async { Ok(()) }).await;
+        assert_eq!(g.result, Err(GuardErr::Denied(Denied::CircuitOpen)), "denied by the breaker, not OverCap");
+        // after the breaker window the model is callable again the same day
+        let later = Utc::now() + chrono::Duration::minutes(5);
+        let g: Guarded<()> = guarded(&b, Priority::High, later, || async { Ok(()) }).await;
+        assert_eq!(g.result, Ok(()));
+    }
+
+    #[tokio::test]
     async fn breaker_opens_and_denies() {
         let b = Budget::new(100, 0.0);
         let mut opened = false;

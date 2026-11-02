@@ -96,8 +96,13 @@ impl PpqClient {
             .map_err(map_reqwest)?;
         let status = resp.status().as_u16();
         let text = resp.text().await.map_err(map_reqwest)?;
-        if let Some(e) = map_status(status, &text) {
-            return Err(e);
+        match map_status(status, &text) {
+            // ppq's 429 is a per-minute rate limit on the key, not a spent daily quota:
+            // report it as a retryable server-side failure so the short breaker handles it
+            // instead of switching the model off until midnight UTC.
+            Some(ProviderError::Quota) => return Err(ProviderError::Server(429)),
+            Some(e) => return Err(e),
+            None => {}
         }
         parse(&text)
     }
@@ -289,7 +294,9 @@ mod tests {
     async fn http_errors() {
         let s = MockServer::start().await;
         Mock::given(method("POST")).respond_with(ResponseTemplate::new(429)).mount(&s).await;
-        assert_eq!(client(&s).assess(&Default::default(), Ask::Message).await.unwrap_err(), ProviderError::Quota);
+        let e = client(&s).assess(&Default::default(), Ask::Message).await.unwrap_err();
+        assert_eq!(e, ProviderError::Server(429));
+        assert!(e.is_health_failure() && e.is_retryable());
         let s = MockServer::start().await;
         Mock::given(method("POST")).respond_with(ResponseTemplate::new(500)).mount(&s).await;
         assert_eq!(client(&s).assess(&Default::default(), Ask::Message).await.unwrap_err(), ProviderError::Server(500));
