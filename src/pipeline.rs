@@ -1036,7 +1036,10 @@ mod tests {
     }
 
     async fn harness_with_cfg(cfg: Config, pax: Arc<FakePax>, jev: Arc<FakeJev>, enforce: bool, roll: f64, sink: FakeSink) -> H {
-        harness_full(cfg, pax, FakeJev::clean(), jev, enforce, roll, sink).await
+        // Perplexity mirrors Jev here so a scenario written as "Paxmod + Jev say spam" keeps a
+        // corroborating second model (Jev alone cannot corroborate once Perplexity answers).
+        let pplx = FakeJev::new(jev.result.clone());
+        harness_full(cfg, pax, pplx, jev, enforce, roll, sink).await
     }
 
     async fn harness_full(cfg: Config, pax: Arc<FakePax>, pplx: Arc<FakeJev>, jev: Arc<FakeJev>, enforce: bool, roll: f64, sink: FakeSink) -> H {
@@ -1190,6 +1193,29 @@ mod tests {
         let o = h.p.handle(msg(1, 7, "buy cheap stuff now", new_user(7)), Utc::now()).await;
         assert!(o.verdict.as_ref().unwrap().corroborated);
         assert!(h.sink.has("delete 50 1") && h.sink.has("timeout 7 60"), "log: {:?}", h.sink.log.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paxmod_flag_with_clean_pplx_and_spam_jev_flags_only() {
+        // Jev's policy answer runs hot on ordinary @mentions; once Perplexity has answered
+        // clean, Jev alone must not corroborate a Paxmod hit.
+        let h = harness_full(Config::default(), FakePax::spam_flagged(1.0, "tagging a user to initiate contact"), FakeJev::clean(), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(1, 7, "its working or not. <@1308810777939148800>", new_user(7)), Utc::now()).await;
+        assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+        assert_eq!(o.taken, "flag");
+        assert!(!o.verdict.unwrap().corroborated);
+    }
+
+    #[tokio::test]
+    async fn guild_override_with_low_delete_rung_still_caps_report_only_models() {
+        let cfg = Config::from_toml_str("[defaults.ladder.quarantine]\nflag = 0.30\ndelete = 0.40\ntimeout = 0.40\n").unwrap();
+        // Paxmod clean, both models spam, weak local rule (first_message_link 0.35 < 0.5).
+        let h = harness_full(cfg, FakePax::spam(0.0), FakeJev::spam(), FakeJev::spam(), true, 0.99, FakeSink::default()).await;
+        let o = h.p.handle(msg(1, 7, "look at https://example.com/page", new_user(7)), Utc::now()).await;
+        assert!(h.sink.empty(), "log: {:?}", h.sink.log.lock().unwrap());
+        let v = o.verdict.unwrap();
+        assert!(v.score < 0.40, "score {}", v.score);
+        assert!(o.planned <= Action::Flag, "{:?}", o.planned);
     }
 
     // ---------- Perplexity + Jev on every scanned message ----------

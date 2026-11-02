@@ -6,7 +6,9 @@
 //! report-only: its evidence is shown and it can lift the score to at most
 //! `report_cap` (below the delete rung), but never combines with other terms.
 //! `Verdict.corroborated` records whether a second source agreed (risk >= 0.5, local
-//! counts at score >= 0.5); `policy::decide` never goes past a flag without it.
+//! counts at score >= 0.5); `policy::decide` never goes past a flag without it. Jev
+//! counts as a corroborator only when Perplexity is the acting source or returned no
+//! result: when Perplexity answered and Paxmod acts, Jev alone cannot corroborate.
 
 use crate::config::FusionConfig;
 use crate::model::*;
@@ -130,7 +132,10 @@ pub fn fuse(inp: &Inputs, cfg: &FusionConfig, clean_below: f64, report_cap: f64)
         } else {
             spam_report = spam_report.max(s);
             abuse_report = abuse_report.max(a);
-            corroborated |= hit;
+            // Jev's bot-style risk runs hot on clean @mention messages, so it only
+            // corroborates when Perplexity is acting or gave no answer at all.
+            let may_corroborate = who != Acting::Jev || acting == Acting::Pplx || inp.pplx.is_none();
+            corroborated |= hit && may_corroborate;
         }
     }
 
@@ -279,6 +284,32 @@ mod tests {
         assert!(v.corroborated);
         assert!(!v.evidence.iter().any(|e| e.starts_with("note:")));
         assert_eq!(FusionConfig::default().w_pplx, 0.9);
+    }
+
+    #[test]
+    fn jev_corroborates_only_when_pplx_acts_or_is_absent() {
+        let p = pax(&[("Spam", 1.0)]);
+        let spam = spam_model();
+        let clean = clean_model();
+        // Paxmod acting, Perplexity answered low, Jev high: Jev alone must not corroborate.
+        let v = fz(&Inputs { paxmod: Some(&p), pplx: Some(&clean), jev: Some(&spam), ..Default::default() });
+        assert!(!v.corroborated);
+        // Perplexity returned nothing: Jev may corroborate.
+        let v = fz(&Inputs { paxmod: Some(&p), jev: Some(&spam), ..Default::default() });
+        assert!(v.corroborated);
+        // Perplexity agrees with Paxmod; Jev disagreeing does not matter.
+        let v = fz(&Inputs { paxmod: Some(&p), pplx: Some(&spam), jev: Some(&clean), ..Default::default() });
+        assert!(v.corroborated);
+        // Perplexity acting, Jev agrees.
+        let v = fz(&Inputs { pplx: Some(&spam), jev: Some(&spam), ..Default::default() });
+        assert!(v.corroborated);
+        // Perplexity acting, Jev clean: not corroborated.
+        let v = fz(&Inputs { pplx: Some(&spam), jev: Some(&clean), ..Default::default() });
+        assert!(!v.corroborated);
+        // Local >= 0.5 always counts, whatever the models say.
+        let strong = local(0.6);
+        let v = fz(&Inputs { local: Some(&strong), paxmod: Some(&p), pplx: Some(&clean), jev: Some(&clean), ..Default::default() });
+        assert!(v.corroborated);
     }
 
     #[test]
@@ -440,7 +471,7 @@ mod tests {
     // Regression M1 (fixed): a local-only verdict is no longer capped by w_local —
     // with no other source contributing, the local score fuses at full strength, so
     // flag/delete stay reachable during provider outages. Multi-source math is
-    // unchanged (see sources_combine_noisy_or).
+    // unchanged (see acting_source_and_local_combine_noisy_or_models_stay_report_only).
     #[test]
     fn m1_local_only_max_score_reaches_quarantine_delete_threshold() {
         let delete = crate::config::LadderConfig::default().quarantine.delete.unwrap();
